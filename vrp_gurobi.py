@@ -276,6 +276,50 @@ def stabilize_dual_vector(
     }
 
 
+def dual_shift_ratio(
+    raw_duals: dict[Any, float],
+    previous_raw_duals: dict[Any, float] | None,
+) -> float:
+    if previous_raw_duals is None or not raw_duals:
+        return 0.0
+    average_shift = sum(
+        abs(raw_duals[key] - previous_raw_duals[key]) for key in raw_duals
+    ) / len(raw_duals)
+    average_magnitude = sum(abs(previous_raw_duals[key]) for key in previous_raw_duals) / len(
+        previous_raw_duals
+    )
+    return average_shift / max(average_magnitude, 1.0)
+
+
+def adaptive_stabilization_alpha(
+    base_alpha: float,
+    raw_cover_duals: dict[int, float],
+    previous_raw_cover_duals: dict[int, float] | None,
+    raw_type_duals: dict[str, float],
+    previous_raw_type_duals: dict[str, float] | None,
+    mode: str,
+) -> float:
+    if mode == "fixed" or base_alpha >= 1.0 - 1e-12:
+        return base_alpha
+
+    cover_shift = dual_shift_ratio(raw_cover_duals, previous_raw_cover_duals)
+    type_shift = dual_shift_ratio(raw_type_duals, previous_raw_type_duals)
+    weighted_shift = (
+        cover_shift * len(raw_cover_duals) + type_shift * len(raw_type_duals)
+    ) / max(len(raw_cover_duals) + len(raw_type_duals), 1)
+
+    spread = min(base_alpha, 1.0 - base_alpha, 0.25)
+    min_alpha = max(0.05, base_alpha - spread)
+    max_alpha = min(1.0, base_alpha + spread)
+    if weighted_shift <= 0.05:
+        return max_alpha
+    if weighted_shift >= 0.35:
+        return min_alpha
+
+    position = (weighted_shift - 0.05) / 0.30
+    return max_alpha - position * (max_alpha - min_alpha)
+
+
 def route_arc_set(stop_sequence: tuple[int, ...]) -> frozenset[tuple[int, int]]:
     if not stop_sequence:
         return frozenset()
@@ -1182,6 +1226,7 @@ def solve_node_relaxation(
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
     dual_stabilization_alpha: float,
+    dual_stabilization_mode: str,
     deadline: float | None,
     progress: ProgressTracker | None = None,
     node_label: str = "root",
@@ -1205,6 +1250,8 @@ def solve_node_relaxation(
 
     stabilized_cover_duals: dict[int, float] | None = None
     stabilized_type_duals: dict[str, float] | None = None
+    previous_raw_cover_duals: dict[int, float] | None = None
+    previous_raw_type_duals: dict[str, float] | None = None
     iteration = 0
     while max_cg_iterations is None or iteration < max_cg_iterations:
         iteration += 1
@@ -1238,16 +1285,26 @@ def solve_node_relaxation(
         raw_type_duals = {
             type_id: node_master.type_constraints[type_id].Pi for type_id in vehicle_types
         }
+        current_alpha = adaptive_stabilization_alpha(
+            base_alpha=dual_stabilization_alpha,
+            raw_cover_duals=raw_cover_duals,
+            previous_raw_cover_duals=previous_raw_cover_duals,
+            raw_type_duals=raw_type_duals,
+            previous_raw_type_duals=previous_raw_type_duals,
+            mode=dual_stabilization_mode,
+        )
         stabilized_cover_duals = stabilize_dual_vector(
             raw_duals=raw_cover_duals,
             previous_duals=stabilized_cover_duals,
-            alpha=dual_stabilization_alpha,
+            alpha=current_alpha,
         )
         stabilized_type_duals = stabilize_dual_vector(
             raw_duals=raw_type_duals,
             previous_duals=stabilized_type_duals,
-            alpha=dual_stabilization_alpha,
+            alpha=current_alpha,
         )
+        previous_raw_cover_duals = raw_cover_duals
+        previous_raw_type_duals = raw_type_duals
 
         new_routes: list[RouteColumn] = []
         for vehicle_type in vehicle_types.values():
@@ -1432,6 +1489,7 @@ def create_model(
     max_cg_iterations: int | None = 200,
     pricing_time_limit: float | None = None,
     dual_stabilization_alpha: float = 0.5,
+    dual_stabilization_mode: str = "adaptive",
 ) -> tuple[gp.Model, dict[str, Any]]:
     instance = load_instance(workbook_path)
     validate_route_based_assumptions(instance)
@@ -1453,6 +1511,7 @@ def create_model(
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
         dual_stabilization_alpha=dual_stabilization_alpha,
+        dual_stabilization_mode=dual_stabilization_mode,
         deadline=None,
         progress=None,
         node_label="root",
@@ -1474,6 +1533,7 @@ def create_model(
             "lp_objective": root_result.lower_bound,
             "column_count": len(root_result.routes),
             "dual_stabilization_alpha": dual_stabilization_alpha,
+            "dual_stabilization_mode": dual_stabilization_mode,
             "note": (
                 "This is the root restricted master over generated columns. "
                 "Exact solves happen through solve_model(), which runs branch-and-price."
@@ -1490,6 +1550,7 @@ def branch_and_price(
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
     dual_stabilization_alpha: float,
+    dual_stabilization_mode: str,
     max_bp_nodes: int | None,
     heuristic_time_limit: float | None,
     progress: ProgressTracker | None = None,
@@ -1572,6 +1633,7 @@ def branch_and_price(
                 max_cg_iterations=max_cg_iterations,
                 pricing_time_limit=pricing_time_limit,
                 dual_stabilization_alpha=dual_stabilization_alpha,
+                dual_stabilization_mode=dual_stabilization_mode,
                 deadline=deadline,
                 progress=progress,
                 node_label=f"node depth {depth}",
@@ -1772,6 +1834,7 @@ def solve_model(
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
     dual_stabilization_alpha: float,
+    dual_stabilization_mode: str,
     max_bp_nodes: int | None,
     heuristic_time_limit: float | None = HEURISTIC_MASTER_TIME_LIMIT,
     progress: ProgressTracker | None = None,
@@ -1784,6 +1847,7 @@ def solve_model(
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
         dual_stabilization_alpha=dual_stabilization_alpha,
+        dual_stabilization_mode=dual_stabilization_mode,
         max_bp_nodes=max_bp_nodes,
         heuristic_time_limit=heuristic_time_limit,
         progress=progress,
@@ -1896,8 +1960,17 @@ def parse_args() -> argparse.Namespace:
         type=parse_closed_unit_interval,
         default=0.5,
         help=(
-            "Exponential smoothing weight for pricing duals. "
-            "Use 1.0 for raw duals, or smaller values like 0.3-0.7 to stabilize CG."
+            "Base exponential smoothing weight for pricing duals. "
+            "In adaptive mode this is the center value; use 1.0 for raw duals."
+        ),
+    )
+    parser.add_argument(
+        "--dual-stabilization-mode",
+        choices=("adaptive", "fixed"),
+        default="adaptive",
+        help=(
+            "Use a fixed stabilization alpha every iteration, or adapt it based on "
+            "how much the raw duals move between CG iterations."
         ),
     )
     parser.add_argument(
@@ -1949,6 +2022,7 @@ def main() -> None:
         max_cg_iterations=args.max_cg_iterations,
         pricing_time_limit=args.pricing_time_limit,
         dual_stabilization_alpha=args.dual_stabilization_alpha,
+        dual_stabilization_mode=args.dual_stabilization_mode,
         max_bp_nodes=args.max_bp_nodes,
         heuristic_time_limit=heuristic_time_limit,
         progress=progress,
