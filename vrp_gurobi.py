@@ -123,6 +123,16 @@ class BranchAndPriceResult:
     root_lp_objective: float | None
 
 
+@dataclass(frozen=True)
+class PricingLabel:
+    node: int
+    visited_mask: int
+    load_kg: float
+    time_after_service: float
+    reduced_cost: float
+    predecessor_idx: int | None
+
+
 class ProgressTracker:
     def __init__(self, enabled: bool, interval_seconds: float) -> None:
         self.enabled = enabled
@@ -163,6 +173,8 @@ def optimize_with_heartbeat(
         if where not in active_callback_points:
             return
         runtime = cb_model.cbGet(GRB.Callback.RUNTIME)
+        if runtime < progress.interval_seconds:
+            return
         if runtime - last_runtime_report[0] < progress.interval_seconds:
             return
         progress.emit(
@@ -383,6 +395,23 @@ def route_distance_unit_cost(instance: Instance, vehicle_type: VehicleTypeData) 
     return vehicle_type.cost_per_mile + (
         instance.cost_params["Fuel_Cost_per_Liter"]
         * instance.cost_params["Avg_Fuel_Consumption_L_per_mile"]
+    )
+
+
+def incremental_labor_cost(
+    instance: Instance,
+    elapsed_before_min: float,
+    delta_min: float,
+) -> float:
+    if delta_min <= 0:
+        return 0.0
+
+    regular_remaining = max(regular_limit_minutes(instance) - elapsed_before_min, 0.0)
+    regular_piece = min(delta_min, regular_remaining)
+    overtime_piece = max(delta_min - regular_piece, 0.0)
+    return (
+        regular_piece / 60.0 * instance.cost_params["Driver_Hourly_Wage"]
+        + overtime_piece / 60.0 * instance.cost_params["Overtime_Hourly_Rate"]
     )
 
 
@@ -696,17 +725,40 @@ def solve_pricing_subproblem(
     start_limit = vehicle_start_limit(instance, vehicle_type)
     end_limit = vehicle_end_limit(instance, vehicle_type)
     route_horizon = max(end_limit - start_limit, 0.0)
-    route_used_max_regular = regular_limit_minutes(instance)
+    if route_horizon <= 0:
+        return None
 
-    stop_lb: dict[int, float] = {}
-    stop_ub: dict[int, float] = {}
+    pricing_start = perf_counter()
+    distance_unit_cost = route_distance_unit_cost(instance, vehicle_type)
+    last_forced_stops = {
+        i for i, j in branch_ctx.forced_arcs if i != DEPOT_NODE and j == DEPOT_NODE
+    }
+
+    def check_time_limit() -> None:
+        now = perf_counter()
+        if deadline is not None and now >= deadline - 1e-9:
+            raise TimeoutError("Overall time limit reached during pricing.")
+        if pricing_time_limit is not None and now >= pricing_start + pricing_time_limit - 1e-9:
+            raise RuntimeError(
+                "A pricing subproblem hit the user pricing time limit before optimality. "
+                "Exact branch-and-price requires complete label-setting pricing."
+            )
+
+    stop_to_pos = {stop_id: idx for idx, stop_id in enumerate(stop_ids)}
+    stop_mask = {stop_id: 1 << stop_to_pos[stop_id] for stop_id in stop_ids}
+
     feasible_stop: dict[int, bool] = {}
-    late_ub: dict[int, float] = {}
+    potential_successors: dict[int, list[int]] = {DEPOT_NODE: []}
+    for stop_id in stop_ids:
+        potential_successors[stop_id] = []
 
     for stop_id in stop_ids:
         stop = instance.stops[stop_id]
-        lb = start_limit + instance.travel_minutes[DEPOT_NODE, stop_id]
-        ub = end_limit - stop.service_min - instance.travel_minutes[stop_id, DEPOT_NODE]
+        finish_time = (
+            start_limit
+            + instance.travel_minutes[DEPOT_NODE, stop_id]
+            + stop.service_min
+        )
         assignment_allowed = True
         forced_type = branch_ctx.forced_type_for_stop.get(stop_id)
         if forced_type is not None and forced_type != vehicle_type.type_id:
@@ -716,273 +768,240 @@ def solve_pricing_subproblem(
 
         feasible = (
             assignment_allowed
-            and stop.demand_kg <= vehicle_type.capacity_kg
-            and lb <= ub
+            and stop.demand_kg <= vehicle_type.capacity_kg + 1e-9
+            and finish_time + instance.travel_minutes[stop_id, DEPOT_NODE] <= end_limit + 1e-9
         )
-        stop_lb[stop_id] = lb
-        stop_ub[stop_id] = ub
         feasible_stop[stop_id] = feasible
-        late_ub[stop_id] = max(ub - stop.latest_min, 0.0) if feasible else 0.0
-
-    if route_horizon <= 0:
-        return None
-
-    arc_keys: list[tuple[int, int]] = []
-    for stop_id in stop_ids:
-        if feasible_stop[stop_id] and (DEPOT_NODE, stop_id) not in branch_ctx.forbidden_arcs:
-            arc_keys.append((DEPOT_NODE, stop_id))
-        if feasible_stop[stop_id] and (stop_id, DEPOT_NODE) not in branch_ctx.forbidden_arcs:
-            arc_keys.append((stop_id, DEPOT_NODE))
+        if feasible and (DEPOT_NODE, stop_id) not in branch_ctx.forbidden_arcs:
+            potential_successors[DEPOT_NODE].append(stop_id)
 
     for i in stop_ids:
         if not feasible_stop[i]:
             continue
+        earliest_depart_i = (
+            start_limit
+            + instance.travel_minutes[DEPOT_NODE, i]
+            + instance.stops[i].service_min
+        )
         for j in stop_ids:
             if i == j or not feasible_stop[j]:
                 continue
             if (i, j) in branch_ctx.forbidden_arcs:
                 continue
-            if (
-                stop_lb[i]
-                + instance.stops[i].service_min
+            earliest_finish_j = (
+                earliest_depart_i
                 + instance.travel_minutes[i, j]
-                <= stop_ub[j]
+                + instance.stops[j].service_min
+            )
+            if earliest_finish_j + instance.travel_minutes[j, DEPOT_NODE] <= end_limit + 1e-9:
+                potential_successors[i].append(j)
+
+    label_store: list[PricingLabel] = []
+    label_alive: list[bool] = []
+    labels_at_node: dict[int, list[int]] = defaultdict(list)
+    frontier: list[tuple[float, int]] = []
+    explored_labels = 0
+
+    def dominates(lhs: PricingLabel, rhs: PricingLabel) -> bool:
+        return (
+            lhs.node == rhs.node
+            and lhs.time_after_service <= rhs.time_after_service + 1e-9
+            and lhs.load_kg <= rhs.load_kg + 1e-9
+            and lhs.reduced_cost <= rhs.reduced_cost + 1e-9
+            and (lhs.visited_mask & ~rhs.visited_mask) == 0
+        )
+
+    def can_return_from(label: PricingLabel) -> bool:
+        if label.node in branch_ctx.forced_successor:
+            return False
+        if (label.node, DEPOT_NODE) in branch_ctx.forbidden_arcs:
+            return False
+        return (
+            label.time_after_service + instance.travel_minutes[label.node, DEPOT_NODE]
+            <= end_limit + 1e-9
+        )
+
+    def complete_reduced_cost(label: PricingLabel) -> float:
+        elapsed_before = label.time_after_service - start_limit
+        return_delta = instance.travel_minutes[label.node, DEPOT_NODE]
+        return (
+            label.reduced_cost
+            + instance.distance_miles[label.node, DEPOT_NODE] * distance_unit_cost
+            + incremental_labor_cost(instance, elapsed_before, return_delta)
+        )
+
+    def reconstruct_route(label_idx: int) -> RouteColumn:
+        sequence: list[int] = []
+        cursor = label_idx
+        while cursor is not None:
+            current_label = label_store[cursor]
+            sequence.append(current_label.node)
+            cursor = current_label.predecessor_idx
+        sequence.reverse()
+        route = evaluate_route_sequence(instance, vehicle_type, tuple(sequence))
+        if route is None:
+            raise RuntimeError(
+                f"Label-setting pricing reconstructed an invalid route for "
+                f"{vehicle_type.type_id}: {sequence}"
+            )
+        if not route_is_compatible(route, branch_ctx):
+            raise RuntimeError(
+                f"Label-setting pricing reconstructed a branch-incompatible route for "
+                f"{vehicle_type.type_id}: {sequence}"
+            )
+        return route
+
+    def exact_route_reduced_cost(route: RouteColumn) -> float:
+        return route.cost - sum(cover_duals[stop_id] for stop_id in route.stop_sequence) - type_dual
+
+    def add_label(label: PricingLabel) -> int | None:
+        node_labels = labels_at_node[label.node]
+        surviving: list[int] = []
+        for idx in node_labels:
+            incumbent = label_store[idx]
+            if dominates(incumbent, label):
+                return None
+            if dominates(label, incumbent):
+                label_alive[idx] = False
+                continue
+            surviving.append(idx)
+
+        label_idx = len(label_store)
+        label_store.append(label)
+        label_alive.append(True)
+        surviving.append(label_idx)
+        labels_at_node[label.node] = surviving
+        heapq.heappush(frontier, (label.reduced_cost, label_idx))
+        return label_idx
+
+    def candidate_successors(label: PricingLabel) -> list[int]:
+        forced_next = branch_ctx.forced_successor.get(label.node)
+        if forced_next is not None:
+            if (
+                forced_next in stop_mask
+                and label.visited_mask & stop_mask[forced_next] == 0
+                and forced_next in potential_successors[label.node]
             ):
-                arc_keys.append((i, j))
+                return [forced_next]
+            return []
 
-    if not arc_keys:
-        return None
+        if label.node in last_forced_stops:
+            return []
 
-    pricing = gp.Model(f"pricing_{vehicle_type.type_id}")
-    pricing.Params.OutputFlag = 0
-    deadline_limit = remaining_time(deadline)
-    if deadline_limit is not None:
-        if deadline_limit <= 0:
-            raise TimeoutError("Overall time limit reached during pricing.")
-    effective_time_limit = pricing_time_limit
-    if deadline_limit is not None:
-        effective_time_limit = (
-            min(deadline_limit, pricing_time_limit)
-            if pricing_time_limit is not None
-            else deadline_limit
+        candidates: list[int] = []
+        for next_stop in potential_successors[label.node]:
+            if label.visited_mask & stop_mask[next_stop]:
+                continue
+            forced_pred = branch_ctx.forced_predecessor.get(next_stop)
+            if forced_pred is not None and forced_pred != label.node:
+                continue
+            candidates.append(next_stop)
+        return candidates
+
+    if progress is not None:
+        progress.emit(
+            f"{progress_label or f'pricing {vehicle_type.type_id}'}: starting label-setting "
+            f"pricing over {sum(feasible_stop.values())} feasible stops"
         )
-    if effective_time_limit is not None:
-        pricing.Params.TimeLimit = effective_time_limit
 
-    x = pricing.addVars(arc_keys, vtype=GRB.BINARY, name="x")
-    y = pricing.addVars(stop_ids, vtype=GRB.BINARY, name="y")
-    service_start = pricing.addVars(stop_ids, lb=0.0, name="service_start")
-    late_min = pricing.addVars(stop_ids, lb=0.0, name="late_min")
-    route_used = pricing.addVar(vtype=GRB.BINARY, name="route_used")
-    return_min = pricing.addVar(lb=0.0, ub=end_limit, name="return_min")
-    active_min = pricing.addVar(lb=0.0, ub=route_horizon, name="active_min")
-    regular_min = pricing.addVar(lb=0.0, ub=route_used_max_regular, name="regular_min")
-    overtime_min = pricing.addVar(lb=0.0, ub=route_horizon, name="overtime_min")
-
-    outgoing = {
-        node: [head for tail, head in arc_keys if tail == node]
-        for node in [DEPOT_NODE] + stop_ids
-    }
-    incoming = {
-        node: [tail for tail, head in arc_keys if head == node]
-        for node in [DEPOT_NODE] + stop_ids
-    }
-
-    pricing.addConstr(
-        gp.quicksum(x[DEPOT_NODE, j] for j in outgoing[DEPOT_NODE]) == route_used,
-        name="route_start",
-    )
-    pricing.addConstr(
-        gp.quicksum(x[i, DEPOT_NODE] for i in incoming[DEPOT_NODE]) == route_used,
-        name="route_end",
-    )
-
-    for stop_id in stop_ids:
-        if not feasible_stop[stop_id]:
-            pricing.addConstr(y[stop_id] == 0, name=f"infeasible_stop[{stop_id}]")
-            pricing.addConstr(service_start[stop_id] == 0, name=f"no_time[{stop_id}]")
-            pricing.addConstr(late_min[stop_id] == 0, name=f"no_late[{stop_id}]")
+    for start_stop in potential_successors[DEPOT_NODE]:
+        forced_pred = branch_ctx.forced_predecessor.get(start_stop)
+        if forced_pred is not None and forced_pred != DEPOT_NODE:
             continue
 
-        pricing.addConstr(
-            gp.quicksum(x[i, stop_id] for i in incoming[stop_id]) == y[stop_id],
-            name=f"in_degree[{stop_id}]",
-        )
-        pricing.addConstr(
-            gp.quicksum(x[stop_id, j] for j in outgoing[stop_id]) == y[stop_id],
-            name=f"out_degree[{stop_id}]",
-        )
-        pricing.addConstr(
-            service_start[stop_id] >= stop_lb[stop_id] * y[stop_id],
-            name=f"time_lb[{stop_id}]",
-        )
-        pricing.addConstr(
-            service_start[stop_id] <= stop_ub[stop_id] * y[stop_id],
-            name=f"time_ub[{stop_id}]",
-        )
-        pricing.addConstr(
-            late_min[stop_id]
-            >= service_start[stop_id]
-            - instance.stops[stop_id].latest_min
-            - stop_ub[stop_id] * (1 - y[stop_id]),
-            name=f"late_lb[{stop_id}]",
-        )
-        pricing.addConstr(
-            late_min[stop_id] <= late_ub[stop_id] * y[stop_id],
-            name=f"late_ub[{stop_id}]",
+        stop = instance.stops[start_stop]
+        arrival = start_limit + instance.travel_minutes[DEPOT_NODE, start_stop]
+        time_after_service = arrival + stop.service_min
+        elapsed = time_after_service - start_limit
+        reduced_cost = (
+            vehicle_type.fixed_daily_cost
+            - type_dual
+            + instance.distance_miles[DEPOT_NODE, start_stop] * distance_unit_cost
+            + incremental_labor_cost(instance, 0.0, elapsed)
+            + max(arrival - stop.latest_min, 0.0)
+            / 60.0
+            * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+            - cover_duals[start_stop]
         )
 
-        if (DEPOT_NODE, stop_id) in x:
-            big_m = start_limit + instance.travel_minutes[DEPOT_NODE, stop_id]
-            pricing.addConstr(
-                service_start[stop_id]
-                >= start_limit
-                + instance.travel_minutes[DEPOT_NODE, stop_id]
-                - big_m * (1 - x[DEPOT_NODE, stop_id]),
-                name=f"from_depot[{stop_id}]",
+        label_idx = add_label(
+            PricingLabel(
+                node=start_stop,
+                visited_mask=stop_mask[start_stop],
+                load_kg=stop.demand_kg,
+                time_after_service=time_after_service,
+                reduced_cost=reduced_cost,
+                predecessor_idx=None,
             )
-        if (stop_id, DEPOT_NODE) in x:
-            big_m = (
-                stop_ub[stop_id]
-                + instance.stops[stop_id].service_min
-                + instance.travel_minutes[stop_id, DEPOT_NODE]
-            )
-            pricing.addConstr(
-                return_min
-                >= service_start[stop_id]
-                + instance.stops[stop_id].service_min
-                + instance.travel_minutes[stop_id, DEPOT_NODE]
-                - big_m * (1 - x[stop_id, DEPOT_NODE]),
-                name=f"to_depot[{stop_id}]",
-            )
+        )
+        if label_idx is not None and can_return_from(label_store[label_idx]):
+            if complete_reduced_cost(label_store[label_idx]) < -REDUCED_COST_TOL:
+                route = reconstruct_route(label_idx)
+                if exact_route_reduced_cost(route) < -REDUCED_COST_TOL:
+                    return route
 
-    for i, j in arc_keys:
-        if i == DEPOT_NODE or j == DEPOT_NODE:
+    while frontier:
+        _, label_idx = heapq.heappop(frontier)
+        if not label_alive[label_idx]:
             continue
-        big_m = stop_ub[i] + instance.stops[i].service_min + instance.travel_minutes[i, j]
-        pricing.addConstr(
-            service_start[j]
-            >= service_start[i]
-            + instance.stops[i].service_min
-            + instance.travel_minutes[i, j]
-            - big_m * (1 - x[i, j]),
-            name=f"time_link[{i},{j}]",
-        )
 
-    for i, j in branch_ctx.forced_arcs:
-        if i == DEPOT_NODE:
-            if feasible_stop[j]:
-                if (i, j) in x:
-                    pricing.addConstr(x[i, j] == y[j], name=f"force_arc[{i},{j}]")
-                else:
-                    pricing.addConstr(y[j] == 0, name=f"force_off[{i},{j}]")
-        elif j == DEPOT_NODE:
-            if feasible_stop[i]:
-                if (i, j) in x:
-                    pricing.addConstr(x[i, j] == y[i], name=f"force_arc[{i},{j}]")
-                else:
-                    pricing.addConstr(y[i] == 0, name=f"force_off[{i},{j}]")
-        else:
-            if feasible_stop[i] and feasible_stop[j] and (i, j) in x:
-                pricing.addConstr(x[i, j] == y[i], name=f"force_succ[{i},{j}]")
-                pricing.addConstr(x[i, j] == y[j], name=f"force_pred[{i},{j}]")
-            else:
-                if feasible_stop[i]:
-                    pricing.addConstr(y[i] == 0, name=f"force_stop_off[{i}]")
-                if feasible_stop[j]:
-                    pricing.addConstr(y[j] == 0, name=f"force_stop_off[{j}]")
+        explored_labels += 1
+        if explored_labels % 250 == 0:
+            check_time_limit()
+            if progress is not None:
+                progress.emit(
+                    f"{progress_label or f'pricing {vehicle_type.type_id}'}: explored "
+                    f"{explored_labels} labels, frontier {len(frontier)}"
+                )
 
-    pricing.addConstr(
-        gp.quicksum(instance.stops[s].demand_kg * y[s] for s in stop_ids)
-        <= vehicle_type.capacity_kg * route_used,
-        name="capacity",
-    )
-    pricing.addConstr(
-        return_min <= end_limit * route_used,
-        name="return_upper",
-    )
-    pricing.addConstr(
-        active_min == return_min - start_limit * route_used,
-        name="active_time",
-    )
-    pricing.addConstr(
-        regular_min + overtime_min == active_min,
-        name="labor_split",
-    )
-    pricing.addConstr(
-        regular_min <= route_used_max_regular * route_used,
-        name="regular_cap",
-    )
+        label = label_store[label_idx]
+        for next_stop in candidate_successors(label):
+            next_stop_data = instance.stops[next_stop]
+            new_load = label.load_kg + next_stop_data.demand_kg
+            if new_load > vehicle_type.capacity_kg + 1e-9:
+                continue
 
-    distance_cost_expr = gp.quicksum(
-        instance.distance_miles[i, j]
-        * route_distance_unit_cost(instance, vehicle_type)
-        * x[i, j]
-        for i, j in arc_keys
-    )
-    labor_cost_expr = (
-        regular_min / 60.0 * instance.cost_params["Driver_Hourly_Wage"]
-        + overtime_min / 60.0 * instance.cost_params["Overtime_Hourly_Rate"]
-    )
-    late_cost_expr = (
-        gp.quicksum(late_min[s] for s in stop_ids)
-        / 60.0
-        * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
-    )
-    reduced_cost_objective = (
-        vehicle_type.fixed_daily_cost * route_used
-        + distance_cost_expr
-        + labor_cost_expr
-        + late_cost_expr
-        - gp.quicksum(cover_duals[s] * y[s] for s in stop_ids)
-        - type_dual * route_used
-    )
-    pricing.setObjective(reduced_cost_objective, GRB.MINIMIZE)
-    optimize_with_heartbeat(
-        pricing,
-        progress=progress,
-        label=progress_label or f"pricing {vehicle_type.type_id}",
-    )
+            arrival = label.time_after_service + instance.travel_minutes[label.node, next_stop]
+            time_after_service = arrival + next_stop_data.service_min
+            if time_after_service + instance.travel_minutes[next_stop, DEPOT_NODE] > end_limit + 1e-9:
+                continue
 
-    if pricing.Status == GRB.TIME_LIMIT:
-        if deadline_limit is not None and (
-            pricing_time_limit is None or deadline_limit <= pricing_time_limit + 1e-9
-        ):
-            raise TimeoutError("Overall time limit reached during pricing.")
-        raise RuntimeError(
-            "A pricing subproblem hit the user pricing time limit before optimality. "
-            "Exact branch-and-price requires optimal pricing solves."
-        )
-    if pricing.Status != GRB.OPTIMAL:
-        raise RuntimeError(
-            f"Pricing problem for {vehicle_type.type_id} failed with status {pricing.Status}."
-        )
+            elapsed_before = label.time_after_service - start_limit
+            delta_minutes = (
+                instance.travel_minutes[label.node, next_stop]
+                + next_stop_data.service_min
+            )
+            new_reduced_cost = (
+                label.reduced_cost
+                + instance.distance_miles[label.node, next_stop] * distance_unit_cost
+                + incremental_labor_cost(instance, elapsed_before, delta_minutes)
+                + max(arrival - next_stop_data.latest_min, 0.0)
+                / 60.0
+                * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+                - cover_duals[next_stop]
+            )
 
-    if route_used.X < 0.5 or pricing.ObjVal >= -REDUCED_COST_TOL:
-        return None
+            new_label_idx = add_label(
+                PricingLabel(
+                    node=next_stop,
+                    visited_mask=label.visited_mask | stop_mask[next_stop],
+                    load_kg=new_load,
+                    time_after_service=time_after_service,
+                    reduced_cost=new_reduced_cost,
+                    predecessor_idx=label_idx,
+                )
+            )
+            if new_label_idx is None:
+                continue
 
-    sequence: list[int] = []
-    current = DEPOT_NODE
-    while True:
-        next_nodes = [j for j in outgoing[current] if x[current, j].X > 0.5]
-        if not next_nodes:
-            break
-        next_node = next_nodes[0]
-        if next_node == DEPOT_NODE:
-            break
-        sequence.append(next_node)
-        current = next_node
+            new_label = label_store[new_label_idx]
+            if can_return_from(new_label) and complete_reduced_cost(new_label) < -REDUCED_COST_TOL:
+                route = reconstruct_route(new_label_idx)
+                if exact_route_reduced_cost(route) < -REDUCED_COST_TOL:
+                    return route
 
-    route = evaluate_route_sequence(instance, vehicle_type, tuple(sequence))
-    if route is None:
-        raise RuntimeError(
-            f"Pricing returned an invalid route for {vehicle_type.type_id}: {sequence}"
-        )
-    if not route_is_compatible(route, branch_ctx):
-        raise RuntimeError(
-            f"Pricing returned a branch-incompatible route for {vehicle_type.type_id}: {sequence}"
-        )
-    return route
+    check_time_limit()
+    return None
 
 
 def build_master_model(
