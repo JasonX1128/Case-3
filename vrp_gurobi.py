@@ -240,6 +240,13 @@ def parse_optional_int_limit(value: str) -> int | None:
     return parsed
 
 
+def parse_closed_unit_interval(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("Value must be between 0 and 1, inclusive.")
+    return parsed
+
+
 def remaining_time(deadline: float | None) -> float | None:
     if deadline is None:
         return None
@@ -252,6 +259,21 @@ def relative_gap(incumbent: float | None, best_bound: float | None) -> float | N
     if abs(incumbent) <= INTEGRALITY_TOL:
         return 0.0 if abs(incumbent - best_bound) <= INTEGRALITY_TOL else None
     return max(incumbent - best_bound, 0.0) / abs(incumbent)
+
+
+def stabilize_dual_vector(
+    raw_duals: dict[Any, float],
+    previous_duals: dict[Any, float] | None,
+    alpha: float,
+) -> dict[Any, float]:
+    if previous_duals is None or alpha >= 1.0 - 1e-12:
+        return dict(raw_duals)
+    if alpha <= 1e-12:
+        return dict(previous_duals)
+    return {
+        key: alpha * raw_duals[key] + (1.0 - alpha) * previous_duals[key]
+        for key in raw_duals
+    }
 
 
 def route_arc_set(stop_sequence: tuple[int, ...]) -> frozenset[tuple[int, int]]:
@@ -1159,6 +1181,7 @@ def solve_node_relaxation(
     branch_state: BranchState,
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
+    dual_stabilization_alpha: float,
     deadline: float | None,
     progress: ProgressTracker | None = None,
     node_label: str = "root",
@@ -1180,6 +1203,8 @@ def solve_node_relaxation(
             force=True,
         )
 
+    stabilized_cover_duals: dict[int, float] | None = None
+    stabilized_type_duals: dict[str, float] | None = None
     iteration = 0
     while max_cg_iterations is None or iteration < max_cg_iterations:
         iteration += 1
@@ -1207,12 +1232,22 @@ def solve_node_relaxation(
             )
 
         last_lp_objective = master_lp.ObjVal
-        cover_duals = {
+        raw_cover_duals = {
             stop_id: node_master.cover_constraints[stop_id].Pi for stop_id in sorted(instance.stops)
         }
-        type_duals = {
+        raw_type_duals = {
             type_id: node_master.type_constraints[type_id].Pi for type_id in vehicle_types
         }
+        stabilized_cover_duals = stabilize_dual_vector(
+            raw_duals=raw_cover_duals,
+            previous_duals=stabilized_cover_duals,
+            alpha=dual_stabilization_alpha,
+        )
+        stabilized_type_duals = stabilize_dual_vector(
+            raw_duals=raw_type_duals,
+            previous_duals=stabilized_type_duals,
+            alpha=dual_stabilization_alpha,
+        )
 
         new_routes: list[RouteColumn] = []
         for vehicle_type in vehicle_types.values():
@@ -1224,8 +1259,8 @@ def solve_node_relaxation(
             route = solve_pricing_subproblem(
                 instance=instance,
                 vehicle_type=vehicle_type,
-                cover_duals=cover_duals,
-                type_dual=type_duals[vehicle_type.type_id],
+                cover_duals=stabilized_cover_duals,
+                type_dual=stabilized_type_duals[vehicle_type.type_id],
                 branch_ctx=branch_ctx,
                 pricing_time_limit=pricing_time_limit,
                 deadline=deadline,
@@ -1396,6 +1431,7 @@ def create_model(
     workbook_path: Path,
     max_cg_iterations: int | None = 200,
     pricing_time_limit: float | None = None,
+    dual_stabilization_alpha: float = 0.5,
 ) -> tuple[gp.Model, dict[str, Any]]:
     instance = load_instance(workbook_path)
     validate_route_based_assumptions(instance)
@@ -1416,6 +1452,7 @@ def create_model(
         branch_state=root_state,
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
+        dual_stabilization_alpha=dual_stabilization_alpha,
         deadline=None,
         progress=None,
         node_label="root",
@@ -1436,6 +1473,7 @@ def create_model(
             "cg_iterations": root_result.cg_iterations,
             "lp_objective": root_result.lower_bound,
             "column_count": len(root_result.routes),
+            "dual_stabilization_alpha": dual_stabilization_alpha,
             "note": (
                 "This is the root restricted master over generated columns. "
                 "Exact solves happen through solve_model(), which runs branch-and-price."
@@ -1451,6 +1489,7 @@ def branch_and_price(
     mip_gap: float | None,
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
+    dual_stabilization_alpha: float,
     max_bp_nodes: int | None,
     heuristic_time_limit: float | None,
     progress: ProgressTracker | None = None,
@@ -1532,6 +1571,7 @@ def branch_and_price(
                 branch_state=branch_state,
                 max_cg_iterations=max_cg_iterations,
                 pricing_time_limit=pricing_time_limit,
+                dual_stabilization_alpha=dual_stabilization_alpha,
                 deadline=deadline,
                 progress=progress,
                 node_label=f"node depth {depth}",
@@ -1731,6 +1771,7 @@ def solve_model(
     mip_gap: float | None,
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
+    dual_stabilization_alpha: float,
     max_bp_nodes: int | None,
     heuristic_time_limit: float | None = HEURISTIC_MASTER_TIME_LIMIT,
     progress: ProgressTracker | None = None,
@@ -1742,6 +1783,7 @@ def solve_model(
         mip_gap=mip_gap,
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
+        dual_stabilization_alpha=dual_stabilization_alpha,
         max_bp_nodes=max_bp_nodes,
         heuristic_time_limit=heuristic_time_limit,
         progress=progress,
@@ -1850,6 +1892,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--dual-stabilization-alpha",
+        type=parse_closed_unit_interval,
+        default=0.5,
+        help=(
+            "Exponential smoothing weight for pricing duals. "
+            "Use 1.0 for raw duals, or smaller values like 0.3-0.7 to stabilize CG."
+        ),
+    )
+    parser.add_argument(
         "--max-bp-nodes",
         type=int,
         default=None,
@@ -1897,6 +1948,7 @@ def main() -> None:
         mip_gap=args.mip_gap,
         max_cg_iterations=args.max_cg_iterations,
         pricing_time_limit=args.pricing_time_limit,
+        dual_stabilization_alpha=args.dual_stabilization_alpha,
         max_bp_nodes=args.max_bp_nodes,
         heuristic_time_limit=heuristic_time_limit,
         progress=progress,
