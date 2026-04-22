@@ -123,6 +123,57 @@ class BranchAndPriceResult:
     root_lp_objective: float | None
 
 
+class ProgressTracker:
+    def __init__(self, enabled: bool, interval_seconds: float) -> None:
+        self.enabled = enabled
+        self.interval_seconds = max(interval_seconds, 0.1)
+        self.start_time = perf_counter()
+        self.last_emit = self.start_time - self.interval_seconds
+
+    def emit(self, message: str, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = perf_counter()
+        if not force and now - self.last_emit < self.interval_seconds:
+            return
+        elapsed = now - self.start_time
+        print(f"[{elapsed:7.1f}s] {message}", flush=True)
+        self.last_emit = now
+
+
+def optimize_with_heartbeat(
+    model: gp.Model,
+    progress: ProgressTracker | None,
+    label: str,
+) -> None:
+    if progress is None or not progress.enabled:
+        model.optimize()
+        return
+
+    active_callback_points = {
+        GRB.Callback.SIMPLEX,
+        GRB.Callback.BARRIER,
+        GRB.Callback.MIP,
+        GRB.Callback.MIPNODE,
+        GRB.Callback.MIPSOL,
+    }
+    last_runtime_report = [-progress.interval_seconds]
+
+    def callback(cb_model: gp.Model, where: int) -> None:
+        if where not in active_callback_points:
+            return
+        runtime = cb_model.cbGet(GRB.Callback.RUNTIME)
+        if runtime - last_runtime_report[0] < progress.interval_seconds:
+            return
+        progress.emit(
+            f"{label}: still solving ({runtime:.1f}s in current Gurobi solve)",
+            force=True,
+        )
+        last_runtime_report[0] = runtime
+
+    model.optimize(callback)
+
+
 def excel_time_to_minutes(value: Any) -> float:
     if value is None:
         raise ValueError("Encountered an empty time value.")
@@ -153,6 +204,17 @@ def minutes_to_clock(minutes: float) -> str:
     total_minutes = int(round(minutes))
     hours, mins = divmod(total_minutes, 60)
     return f"{hours:02d}:{mins:02d}"
+
+
+def parse_optional_int_limit(value: str) -> int | None:
+    text = value.strip().lower()
+    if text in {"none", "unlimited", "inf", "infinite"}:
+        return None
+
+    parsed = int(text)
+    if parsed <= 0:
+        return None
+    return parsed
 
 
 def remaining_time(deadline: float | None) -> float | None:
@@ -627,6 +689,8 @@ def solve_pricing_subproblem(
     branch_ctx: BranchContext,
     pricing_time_limit: float | None,
     deadline: float | None,
+    progress: ProgressTracker | None = None,
+    progress_label: str | None = None,
 ) -> RouteColumn | None:
     stop_ids = sorted(instance.stops)
     start_limit = vehicle_start_limit(instance, vehicle_type)
@@ -874,7 +938,11 @@ def solve_pricing_subproblem(
         - type_dual * route_used
     )
     pricing.setObjective(reduced_cost_objective, GRB.MINIMIZE)
-    pricing.optimize()
+    optimize_with_heartbeat(
+        pricing,
+        progress=progress,
+        label=progress_label or f"pricing {vehicle_type.type_id}",
+    )
 
     if pricing.Status == GRB.TIME_LIMIT:
         if deadline_limit is not None and (
@@ -994,9 +1062,11 @@ def solve_node_relaxation(
     route_pool: list[RouteColumn],
     route_key_set: set[tuple[str, tuple[int, ...]]],
     branch_state: BranchState,
-    max_cg_iterations: int,
+    max_cg_iterations: int | None,
     pricing_time_limit: float | None,
     deadline: float | None,
+    progress: ProgressTracker | None = None,
+    node_label: str = "root",
 ) -> NodeRelaxationResult | None:
     branch_ctx = build_branch_context(branch_state, instance, vehicle_types)
     if branch_ctx is None:
@@ -1004,8 +1074,20 @@ def solve_node_relaxation(
 
     compatible_routes = [route for route in route_pool if route_is_compatible(route, branch_ctx)]
     last_lp_objective = float("nan")
+    if progress is not None:
+        progress.emit(
+            f"{node_label}: starting node relaxation with {len(compatible_routes)} compatible columns",
+            force=True,
+        )
 
-    for iteration in range(1, max_cg_iterations + 1):
+    iteration = 0
+    while max_cg_iterations is None or iteration < max_cg_iterations:
+        iteration += 1
+        if progress is not None:
+            progress.emit(
+                f"{node_label}: CG iteration {iteration}, solving master LP over "
+                f"{len(compatible_routes)} columns"
+            )
         master_lp, lp_data = build_master_model(
             instance=instance,
             vehicle_types=vehicle_types,
@@ -1018,7 +1100,11 @@ def solve_node_relaxation(
             if master_time_limit <= 0:
                 raise TimeoutError("Overall time limit reached during node LP.")
             master_lp.Params.TimeLimit = master_time_limit
-        master_lp.optimize()
+        optimize_with_heartbeat(
+            master_lp,
+            progress=progress,
+            label=f"{node_label}: master LP iteration {iteration}",
+        )
         if master_lp.Status == GRB.TIME_LIMIT:
             raise TimeoutError("Overall time limit reached during node LP.")
         if master_lp.Status != GRB.OPTIMAL:
@@ -1036,6 +1122,11 @@ def solve_node_relaxation(
 
         new_routes: list[RouteColumn] = []
         for vehicle_type in vehicle_types.values():
+            if progress is not None:
+                progress.emit(
+                    f"{node_label}: CG iteration {iteration}, pricing {vehicle_type.type_id} "
+                    f"at LP bound {last_lp_objective:.2f}"
+                )
             route = solve_pricing_subproblem(
                 instance=instance,
                 vehicle_type=vehicle_type,
@@ -1044,6 +1135,8 @@ def solve_node_relaxation(
                 branch_ctx=branch_ctx,
                 pricing_time_limit=pricing_time_limit,
                 deadline=deadline,
+                progress=progress,
+                progress_label=f"{node_label}: pricing {vehicle_type.type_id} in CG iteration {iteration}",
             )
             if route is None:
                 continue
@@ -1070,6 +1163,12 @@ def solve_node_relaxation(
                 cg_iterations=iteration,
             )
 
+        if progress is not None:
+            progress.emit(
+                f"{node_label}: CG iteration {iteration} added {len(new_routes)} routes; "
+                f"global column pool is now {len(route_pool)}"
+            )
+
     raise RuntimeError(
         "Maximum column-generation iterations reached before node convergence. "
         "Increase --max-cg-iterations for an exact solve."
@@ -1082,6 +1181,8 @@ def solve_restricted_integer_master(
     routes: list[RouteColumn],
     deadline: float | None,
     heuristic_time_limit: float | None,
+    progress: ProgressTracker | None = None,
+    progress_label: str = "restricted master heuristic",
 ) -> tuple[float, list[RouteColumn]] | None:
     if not routes:
         return None
@@ -1107,7 +1208,7 @@ def solve_restricted_integer_master(
     if effective_time_limit is not None:
         model.Params.TimeLimit = effective_time_limit
 
-    model.optimize()
+    optimize_with_heartbeat(model, progress=progress, label=progress_label)
     if model.Status == GRB.TIME_LIMIT and model.SolCount == 0:
         return None
     if model.SolCount == 0:
@@ -1200,7 +1301,7 @@ def select_fractional_assignment(
 
 def create_model(
     workbook_path: Path,
-    max_cg_iterations: int = 200,
+    max_cg_iterations: int | None = 200,
     pricing_time_limit: float | None = None,
 ) -> tuple[gp.Model, dict[str, Any]]:
     instance = load_instance(workbook_path)
@@ -1223,6 +1324,8 @@ def create_model(
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
         deadline=None,
+        progress=None,
+        node_label="root",
     )
     if root_result is None:
         raise RuntimeError("The root branch-and-price node is infeasible.")
@@ -1253,9 +1356,11 @@ def branch_and_price(
     instance: Instance,
     time_limit: float | None,
     mip_gap: float | None,
-    max_cg_iterations: int,
+    max_cg_iterations: int | None,
     pricing_time_limit: float | None,
     max_bp_nodes: int | None,
+    heuristic_time_limit: float | None,
+    progress: ProgressTracker | None = None,
 ) -> BranchAndPriceResult:
     validate_route_based_assumptions(instance)
     vehicle_types = build_vehicle_types(instance)
@@ -1280,6 +1385,11 @@ def branch_and_price(
     nodes_processed = 0
     nodes_pruned = 0
     status = "UNKNOWN"
+    if progress is not None:
+        progress.emit(
+            f"Starting branch-and-price with {len(route_pool)} initial columns",
+            force=True,
+        )
 
     try:
         initial_heuristic = solve_restricted_integer_master(
@@ -1287,12 +1397,19 @@ def branch_and_price(
             vehicle_types=vehicle_types,
             routes=route_pool,
             deadline=deadline,
-            heuristic_time_limit=HEURISTIC_MASTER_TIME_LIMIT,
+            heuristic_time_limit=heuristic_time_limit,
+            progress=progress,
+            progress_label="initial restricted-master heuristic",
         )
     except TimeoutError:
         initial_heuristic = None
     if initial_heuristic is not None:
         incumbent_obj, incumbent_routes = initial_heuristic
+        if progress is not None:
+            progress.emit(
+                f"Initial restricted-master incumbent: {incumbent_obj:.2f}",
+                force=True,
+            )
 
     while active_nodes:
         if max_bp_nodes is not None and nodes_processed >= max_bp_nodes:
@@ -1307,6 +1424,12 @@ def branch_and_price(
             nodes_pruned += 1
             continue
 
+        if progress is not None:
+            incumbent_text = "none" if incumbent_obj is None else f"{incumbent_obj:.2f}"
+            progress.emit(
+                f"Exploring node depth {depth}, queue {len(active_nodes)}, "
+                f"best hint {lower_bound_hint:.2f}, incumbent {incumbent_text}"
+            )
         try:
             node_result = solve_node_relaxation(
                 instance=instance,
@@ -1317,12 +1440,16 @@ def branch_and_price(
                 max_cg_iterations=max_cg_iterations,
                 pricing_time_limit=pricing_time_limit,
                 deadline=deadline,
+                progress=progress,
+                node_label=f"node depth {depth}",
             )
         except TimeoutError:
             heapq.heappush(
                 active_nodes,
                 (lower_bound_hint, depth, next(sequence_counter), branch_state),
             )
+            if progress is not None:
+                progress.emit("Time limit reached while processing the current node", force=True)
             status = "TIME_LIMIT"
             break
 
@@ -1331,6 +1458,11 @@ def branch_and_price(
             continue
         if root_lp_objective is None:
             root_lp_objective = node_result.lower_bound
+            if progress is not None:
+                progress.emit(
+                    f"Root relaxation closed at {root_lp_objective:.2f}",
+                    force=True,
+                )
 
         node_lb = node_result.lower_bound
         if incumbent_obj is not None and node_lb >= incumbent_obj - INTEGRALITY_TOL:
@@ -1345,13 +1477,20 @@ def branch_and_price(
                     vehicle_types=vehicle_types,
                     routes=node_result.routes,
                     deadline=deadline,
-                    heuristic_time_limit=HEURISTIC_MASTER_TIME_LIMIT,
+                    heuristic_time_limit=heuristic_time_limit,
+                    progress=progress,
+                    progress_label=f"restricted-master heuristic at node depth {depth}",
                 )
             except TimeoutError:
                 heapq.heappush(
                     active_nodes,
                     (node_lb, depth, next(sequence_counter), branch_state),
                 )
+                if progress is not None:
+                    progress.emit(
+                        "Time limit reached while solving the restricted-master heuristic",
+                        force=True,
+                    )
                 status = "TIME_LIMIT"
                 break
             if heuristic_solution is not None:
@@ -1359,6 +1498,11 @@ def branch_and_price(
                 if incumbent_obj is None or heuristic_obj < incumbent_obj - INTEGRALITY_TOL:
                     incumbent_obj = heuristic_obj
                     incumbent_routes = heuristic_routes
+                    if progress is not None:
+                        progress.emit(
+                            f"New incumbent from restricted master: {incumbent_obj:.2f}",
+                            force=True,
+                        )
 
         if is_integral_solution(node_result.route_values):
             selected_routes = [
@@ -1369,6 +1513,11 @@ def branch_and_price(
             if incumbent_obj is None or node_lb < incumbent_obj - INTEGRALITY_TOL:
                 incumbent_obj = node_lb
                 incumbent_routes = selected_routes
+                if progress is not None:
+                    progress.emit(
+                        f"Found integral node solution: {incumbent_obj:.2f}",
+                        force=True,
+                    )
             continue
 
         if heuristic_obj is not None and abs(heuristic_obj - node_lb) <= 1e-5:
@@ -1445,6 +1594,12 @@ def branch_and_price(
         if incumbent_obj is not None and mip_gap is not None:
             gap = relative_gap(incumbent_obj, best_bound)
             if gap is not None and gap <= mip_gap + 1e-12:
+                if progress is not None:
+                    progress.emit(
+                        f"Gap target reached with incumbent {incumbent_obj:.2f} and "
+                        f"bound {best_bound:.2f}",
+                        force=True,
+                    )
                 status = "GAP_LIMIT"
                 break
 
@@ -1481,9 +1636,11 @@ def solve_model(
     workbook_path: Path,
     time_limit: float | None,
     mip_gap: float | None,
-    max_cg_iterations: int,
+    max_cg_iterations: int | None,
     pricing_time_limit: float | None,
     max_bp_nodes: int | None,
+    heuristic_time_limit: float | None = HEURISTIC_MASTER_TIME_LIMIT,
+    progress: ProgressTracker | None = None,
 ) -> None:
     instance = load_instance(workbook_path)
     result = branch_and_price(
@@ -1493,6 +1650,8 @@ def solve_model(
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
         max_bp_nodes=max_bp_nodes,
+        heuristic_time_limit=heuristic_time_limit,
+        progress=progress,
     )
 
     print(f"Status: {result.status}")
@@ -1581,9 +1740,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-cg-iterations",
-        type=int,
+        type=parse_optional_int_limit,
         default=200,
-        help="Maximum column-generation iterations allowed at each tree node.",
+        help=(
+            "Maximum column-generation iterations allowed at each tree node. "
+            "Use 0, 'none', or 'unlimited' for no cap."
+        ),
     )
     parser.add_argument(
         "--pricing-time-limit",
@@ -1600,11 +1762,42 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap on processed branch-and-price nodes.",
     )
+    parser.add_argument(
+        "--unlimited",
+        action="store_true",
+        help=(
+            "Run with no user-facing time, gap, node, pricing, or column-generation limits. "
+            "This also removes the restricted-master heuristic time cap."
+        ),
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show throttled progress updates during branch-and-price.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=30.0,
+        help="Minimum seconds between non-forced progress updates.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    heuristic_time_limit = HEURISTIC_MASTER_TIME_LIMIT
+    if args.unlimited:
+        args.time_limit = None
+        args.mip_gap = None
+        args.max_cg_iterations = None
+        args.pricing_time_limit = None
+        args.max_bp_nodes = None
+        heuristic_time_limit = None
+    progress = ProgressTracker(
+        enabled=args.progress,
+        interval_seconds=args.progress_interval,
+    )
     solve_model(
         workbook_path=args.workbook,
         time_limit=args.time_limit,
@@ -1612,6 +1805,8 @@ def main() -> None:
         max_cg_iterations=args.max_cg_iterations,
         pricing_time_limit=args.pricing_time_limit,
         max_bp_nodes=args.max_bp_nodes,
+        heuristic_time_limit=heuristic_time_limit,
+        progress=progress,
     )
 
 
