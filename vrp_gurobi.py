@@ -19,6 +19,7 @@ DEPOT_NODE = 0
 REDUCED_COST_TOL = 1e-6
 INTEGRALITY_TOL = 1e-6
 HEURISTIC_MASTER_TIME_LIMIT = 5.0
+ARTIFICIAL_COVER_PENALTY = 1_000_000.0
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,16 @@ class NodeRelaxationResult:
     routes: list[RouteColumn]
     route_values: list[float]
     cg_iterations: int
+
+
+@dataclass
+class NodeMasterLP:
+    model: gp.Model
+    routes: list[RouteColumn]
+    route_vars: list[gp.Var]
+    artificial_vars: dict[int, gp.Var]
+    cover_constraints: dict[int, gp.Constr]
+    type_constraints: dict[str, gp.Constr]
 
 
 @dataclass
@@ -1028,7 +1039,6 @@ def build_master_model(
         if allow_artificial
         else {}
     )
-    artificial_penalty = 1_000_000.0
 
     cover_constraints: dict[int, gp.Constr] = {}
     for stop_id in sorted(instance.stops):
@@ -1055,7 +1065,7 @@ def build_master_model(
         gp.quicksum(routes[idx].cost * route_vars[idx] for idx in route_indices)
         + (
             gp.quicksum(
-                artificial_penalty * artificial_vars[stop_id]
+                ARTIFICIAL_COVER_PENALTY * artificial_vars[stop_id]
                 for stop_id in sorted(instance.stops)
             )
             if allow_artificial
@@ -1075,6 +1085,72 @@ def build_master_model(
     return model, model._data
 
 
+def build_incremental_node_master(
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    routes: list[RouteColumn],
+) -> NodeMasterLP:
+    model = gp.Model("route_based_node_master")
+    model.Params.OutputFlag = 0
+    model.ModelSense = GRB.MINIMIZE
+
+    artificial_vars = model.addVars(
+        sorted(instance.stops),
+        lb=0.0,
+        ub=1.0,
+        obj=ARTIFICIAL_COVER_PENALTY,
+        vtype=GRB.CONTINUOUS,
+        name="artificial_cover",
+    )
+
+    cover_constraints: dict[int, gp.Constr] = {}
+    for stop_id in sorted(instance.stops):
+        cover_constraints[stop_id] = model.addConstr(
+            artificial_vars[stop_id] == 1.0,
+            name=f"cover[{stop_id}]",
+        )
+
+    type_constraints: dict[str, gp.Constr] = {}
+    for type_id, vehicle_type in vehicle_types.items():
+        type_constraints[type_id] = model.addConstr(
+            gp.LinExpr() <= vehicle_type.count,
+            name=f"type_limit[{type_id}]",
+        )
+
+    node_master = NodeMasterLP(
+        model=model,
+        routes=[],
+        route_vars=[],
+        artificial_vars={stop_id: artificial_vars[stop_id] for stop_id in sorted(instance.stops)},
+        cover_constraints=cover_constraints,
+        type_constraints=type_constraints,
+    )
+    for route in routes:
+        add_route_column_to_master(node_master, route)
+    model.update()
+    return node_master
+
+
+def add_route_column_to_master(node_master: NodeMasterLP, route: RouteColumn) -> gp.Var:
+    column = gp.Column()
+    for stop_id in route.stop_set:
+        column.addTerms(1.0, node_master.cover_constraints[stop_id])
+    column.addTerms(1.0, node_master.type_constraints[route.type_id])
+
+    route_index = len(node_master.routes)
+    route_var = node_master.model.addVar(
+        lb=0.0,
+        ub=1.0,
+        obj=route.cost,
+        vtype=GRB.CONTINUOUS,
+        column=column,
+        name=f"route[{route_index}]",
+    )
+    node_master.routes.append(route)
+    node_master.route_vars.append(route_var)
+    return route_var
+
+
 def solve_node_relaxation(
     instance: Instance,
     vehicle_types: dict[str, VehicleTypeData],
@@ -1092,6 +1168,11 @@ def solve_node_relaxation(
         return None
 
     compatible_routes = [route for route in route_pool if route_is_compatible(route, branch_ctx)]
+    node_master = build_incremental_node_master(
+        instance=instance,
+        vehicle_types=vehicle_types,
+        routes=compatible_routes,
+    )
     last_lp_objective = float("nan")
     if progress is not None:
         progress.emit(
@@ -1105,15 +1186,9 @@ def solve_node_relaxation(
         if progress is not None:
             progress.emit(
                 f"{node_label}: CG iteration {iteration}, solving master LP over "
-                f"{len(compatible_routes)} columns"
+                f"{len(node_master.routes)} columns"
             )
-        master_lp, lp_data = build_master_model(
-            instance=instance,
-            vehicle_types=vehicle_types,
-            routes=compatible_routes,
-            relax=True,
-            allow_artificial=True,
-        )
+        master_lp = node_master.model
         master_time_limit = remaining_time(deadline)
         if master_time_limit is not None:
             if master_time_limit <= 0:
@@ -1133,10 +1208,10 @@ def solve_node_relaxation(
 
         last_lp_objective = master_lp.ObjVal
         cover_duals = {
-            stop_id: lp_data["cover_constraints"][stop_id].Pi for stop_id in sorted(instance.stops)
+            stop_id: node_master.cover_constraints[stop_id].Pi for stop_id in sorted(instance.stops)
         }
         type_duals = {
-            type_id: lp_data["type_constraints"][type_id].Pi for type_id in vehicle_types
+            type_id: node_master.type_constraints[type_id].Pi for type_id in vehicle_types
         }
 
         new_routes: list[RouteColumn] = []
@@ -1163,21 +1238,19 @@ def solve_node_relaxation(
             if key not in route_key_set:
                 route_key_set.add(key)
                 route_pool.append(route)
-                compatible_routes.append(route)
                 new_routes.append(route)
+                add_route_column_to_master(node_master, route)
 
         if not new_routes:
             artificial_usage = sum(
-                lp_data["artificial_vars"][stop_id].X for stop_id in sorted(instance.stops)
+                node_master.artificial_vars[stop_id].X for stop_id in sorted(instance.stops)
             )
             if artificial_usage > INTEGRALITY_TOL:
                 return None
-            route_values = [
-                lp_data["route_vars"][idx].X for idx in range(len(compatible_routes))
-            ]
+            route_values = [route_var.X for route_var in node_master.route_vars]
             return NodeRelaxationResult(
                 lower_bound=last_lp_objective,
-                routes=compatible_routes,
+                routes=list(node_master.routes),
                 route_values=route_values,
                 cg_iterations=iteration,
             )
@@ -1187,6 +1260,7 @@ def solve_node_relaxation(
                 f"{node_label}: CG iteration {iteration} added {len(new_routes)} routes; "
                 f"global column pool is now {len(route_pool)}"
             )
+        node_master.model.update()
 
     raise RuntimeError(
         "Maximum column-generation iterations reached before node convergence. "
