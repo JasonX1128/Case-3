@@ -1,0 +1,5 @@
+timestamp,elapsed_seconds,event,status,upper_bound,lower_bound,incumbent_objective,best_bound,relative_gap,nodes_processed,nodes_pruned,global_columns,queue_size,node_depth,note
+2026-04-22T18:15:31-05:00,0.000376,run_start,RUNNING,,,,,,,,,,,Workbook: /Users/jasonxie/Documents/DS235H/Case 3/Team_02_Data.xlsx
+2026-04-22T18:15:31-05:00,0.340817,run_start,RUNNING,,,,,,0,0,88,1,,Initial route pool has 88 columns
+2026-04-22T18:15:31-05:00,0.431981,incumbent_update,RUNNING,1430.1677720000,,1430.1677720000,,,0,0,88,1,,Initial restricted-master incumbent
+2026-04-22T18:24:28-05:00,537.761837,interrupted,INTERRUPTED,1430.1677720000,,1430.1677720000,,,,,,,,Interrupted by SIGINT

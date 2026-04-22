@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import heapq
 import math
 import multiprocessing as mp
 import os
+import signal
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -30,6 +32,8 @@ INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
 
 _PRICING_WORKER_INSTANCE: Instance | None = None
 _PRICING_WORKER_BRANCH_CTX: BranchContext | None = None
+_INTERRUPT_SIGNAL_NAME: str | None = None
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -180,6 +184,117 @@ class ProgressTracker:
         self.last_emit = now
 
 
+class ObjectiveTraceLogger:
+    FIELDNAMES = (
+        "timestamp",
+        "elapsed_seconds",
+        "event",
+        "status",
+        "upper_bound",
+        "lower_bound",
+        "incumbent_objective",
+        "best_bound",
+        "relative_gap",
+        "nodes_processed",
+        "nodes_pruned",
+        "global_columns",
+        "queue_size",
+        "node_depth",
+        "note",
+    )
+
+    def __init__(self, path: Path | None, workbook_path: Path | None) -> None:
+        self.path = path
+        self.workbook_path = workbook_path
+        self.start_time = perf_counter()
+        self.latest_incumbent: float | None = None
+        self.latest_best_bound: float | None = None
+        self.latest_gap: float | None = None
+        self.latest_status: str | None = None
+        self._file = None
+        self._writer: csv.DictWriter[str] | None = None
+
+        if self.path is None:
+            return
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("w", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDNAMES)
+        self._writer.writeheader()
+        self._flush()
+
+    def _flush(self) -> None:
+        if self._file is None:
+            return
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    def record(
+        self,
+        *,
+        event: str,
+        status: str | None = None,
+        incumbent_objective: float | None | object = _MISSING,
+        best_bound: float | None | object = _MISSING,
+        relative_gap: float | None | object = _MISSING,
+        nodes_processed: int | None = None,
+        nodes_pruned: int | None = None,
+        global_columns: int | None = None,
+        queue_size: int | None = None,
+        node_depth: int | None = None,
+        note: str = "",
+    ) -> None:
+        if incumbent_objective is not _MISSING:
+            self.latest_incumbent = incumbent_objective
+        if best_bound is not _MISSING:
+            self.latest_best_bound = best_bound
+        if relative_gap is not _MISSING:
+            self.latest_gap = relative_gap
+        if status is not None:
+            self.latest_status = status
+
+        if self._writer is None:
+            return
+
+        elapsed = perf_counter() - self.start_time
+        self._writer.writerow(
+            {
+                "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "elapsed_seconds": f"{elapsed:.6f}",
+                "event": event,
+                "status": self.latest_status or "",
+                "upper_bound": (
+                    "" if self.latest_incumbent is None else f"{self.latest_incumbent:.10f}"
+                ),
+                "lower_bound": (
+                    "" if self.latest_best_bound is None else f"{self.latest_best_bound:.10f}"
+                ),
+                "incumbent_objective": (
+                    "" if self.latest_incumbent is None else f"{self.latest_incumbent:.10f}"
+                ),
+                "best_bound": (
+                    "" if self.latest_best_bound is None else f"{self.latest_best_bound:.10f}"
+                ),
+                "relative_gap": "" if self.latest_gap is None else f"{self.latest_gap:.10f}",
+                "nodes_processed": "" if nodes_processed is None else nodes_processed,
+                "nodes_pruned": "" if nodes_pruned is None else nodes_pruned,
+                "global_columns": "" if global_columns is None else global_columns,
+                "queue_size": "" if queue_size is None else queue_size,
+                "node_depth": "" if node_depth is None else node_depth,
+                "note": note,
+            }
+        )
+        self._flush()
+
+    def close(self) -> None:
+        if self._file is None:
+            return
+        self._flush()
+        self._file.close()
+        self._file = None
+        self._writer = None
+
+
 def optimize_with_heartbeat(
     model: gp.Model,
     progress: ProgressTracker | None,
@@ -256,6 +371,36 @@ def parse_optional_int_limit(value: str) -> int | None:
     if parsed <= 0:
         return None
     return parsed
+
+
+def optional_float_changed(previous: float | None, current: float | None, tol: float = 1e-9) -> bool:
+    if previous is None or current is None:
+        return previous != current
+    return abs(previous - current) > tol
+
+
+def default_objective_trace_path(workbook_path: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return workbook_path.with_name(f"{workbook_path.stem}_objective_trace_{timestamp}.csv")
+
+
+def install_interrupt_handlers() -> dict[int, Any]:
+    previous_handlers: dict[int, Any] = {}
+
+    def handler(signum: int, _frame: Any) -> None:
+        global _INTERRUPT_SIGNAL_NAME
+        _INTERRUPT_SIGNAL_NAME = signal.Signals(signum).name
+        raise KeyboardInterrupt
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, handler)
+    return previous_handlers
+
+
+def restore_interrupt_handlers(previous_handlers: dict[int, Any]) -> None:
+    for signum, previous_handler in previous_handlers.items():
+        signal.signal(signum, previous_handler)
 
 
 def parse_closed_unit_interval(value: str) -> float:
@@ -2316,6 +2461,7 @@ def branch_and_price(
     max_bp_nodes: int | None,
     heuristic_time_limit: float | None,
     progress: ProgressTracker | None = None,
+    trace_logger: ObjectiveTraceLogger | None = None,
 ) -> BranchAndPriceResult:
     validate_route_based_assumptions(instance)
     vehicle_types = build_vehicle_types(instance)
@@ -2342,11 +2488,67 @@ def branch_and_price(
     nodes_processed = 0
     nodes_pruned = 0
     status = "UNKNOWN"
+
+    def current_global_bound(active_node_hint: float | None = None) -> float | None:
+        if root_lp_objective is None and nodes_processed == 0:
+            return None
+        candidate_bounds: list[float] = []
+        if active_node_hint is not None:
+            candidate_bounds.append(active_node_hint)
+        if active_nodes:
+            candidate_bounds.append(min(bound for bound, *_ in active_nodes))
+        if candidate_bounds:
+            return min(candidate_bounds)
+        if incumbent_obj is not None:
+            return incumbent_obj
+        return root_lp_objective
+
+    last_logged_incumbent: float | None = None
+    last_logged_bound: float | None = None
+
+    def maybe_record_trace(
+        event: str,
+        *,
+        active_node_hint: float | None = None,
+        force: bool = False,
+        note: str = "",
+        node_depth: int | None = None,
+    ) -> None:
+        nonlocal last_logged_bound, last_logged_incumbent
+        if trace_logger is None:
+            return
+        best_bound = current_global_bound(active_node_hint)
+        incumbent_changed = optional_float_changed(last_logged_incumbent, incumbent_obj)
+        bound_changed = optional_float_changed(last_logged_bound, best_bound)
+        if not force and not incumbent_changed and not bound_changed:
+            return
+        gap = relative_gap(incumbent_obj, best_bound)
+        trace_logger.record(
+            event=event,
+            status="RUNNING" if status == "UNKNOWN" else status,
+            incumbent_objective=incumbent_obj,
+            best_bound=best_bound,
+            relative_gap=gap,
+            nodes_processed=nodes_processed,
+            nodes_pruned=nodes_pruned,
+            global_columns=len(route_pool),
+            queue_size=len(active_nodes),
+            node_depth=node_depth,
+            note=note,
+        )
+        last_logged_incumbent = incumbent_obj
+        last_logged_bound = best_bound
+
     if progress is not None:
         progress.emit(
             f"Starting branch-and-price with {len(route_pool)} initial columns",
             force=True,
         )
+    maybe_record_trace(
+        "run_start",
+        force=True,
+        note=f"Initial route pool has {len(route_pool)} columns",
+    )
 
     try:
         initial_heuristic = solve_restricted_integer_master(
@@ -2367,6 +2569,11 @@ def branch_and_price(
                 f"Initial restricted-master incumbent: {incumbent_obj:.2f}",
                 force=True,
             )
+        maybe_record_trace(
+            "incumbent_update",
+            force=True,
+            note="Initial restricted-master incumbent",
+        )
 
     while active_nodes:
         if max_bp_nodes is not None and nodes_processed >= max_bp_nodes:
@@ -2379,6 +2586,10 @@ def branch_and_price(
         lower_bound_hint, depth, _, branch_state = heapq.heappop(active_nodes)
         if incumbent_obj is not None and lower_bound_hint >= incumbent_obj - INTEGRALITY_TOL:
             nodes_pruned += 1
+            maybe_record_trace(
+                "bound_update",
+                note="Pruned queued node by incumbent cutoff",
+            )
             continue
 
         if progress is not None:
@@ -2416,6 +2627,11 @@ def branch_and_price(
 
         nodes_processed += 1
         if node_result is None:
+            maybe_record_trace(
+                "bound_update",
+                note="Pruned infeasible node",
+                node_depth=depth,
+            )
             continue
         if root_lp_objective is None:
             root_lp_objective = node_result.lower_bound
@@ -2424,10 +2640,22 @@ def branch_and_price(
                     f"Root relaxation closed at {root_lp_objective:.2f}",
                     force=True,
                 )
+            maybe_record_trace(
+                "bound_update",
+                active_node_hint=node_result.lower_bound,
+                force=True,
+                note="Root relaxation closed",
+                node_depth=depth,
+            )
 
         node_lb = node_result.lower_bound
         if incumbent_obj is not None and node_lb >= incumbent_obj - INTEGRALITY_TOL:
             nodes_pruned += 1
+            maybe_record_trace(
+                "bound_update",
+                note="Pruned processed node by incumbent cutoff",
+                node_depth=depth,
+            )
             continue
 
         heuristic_obj: float | None = None
@@ -2464,6 +2692,13 @@ def branch_and_price(
                             f"New incumbent from restricted master: {incumbent_obj:.2f}",
                             force=True,
                         )
+                    maybe_record_trace(
+                        "incumbent_update",
+                        active_node_hint=node_lb,
+                        force=True,
+                        note="Improved incumbent from restricted master",
+                        node_depth=depth,
+                    )
 
         if is_integral_solution(node_result.route_values):
             selected_routes = [
@@ -2479,6 +2714,12 @@ def branch_and_price(
                         f"Found integral node solution: {incumbent_obj:.2f}",
                         force=True,
                     )
+                maybe_record_trace(
+                    "incumbent_update",
+                    force=True,
+                    note="Found integral node solution",
+                    node_depth=depth,
+                )
             continue
 
         if heuristic_obj is not None and abs(heuristic_obj - node_lb) <= 1e-5:
@@ -2600,6 +2841,12 @@ def branch_and_price(
                 (node_lb, depth + 1, next(sequence_counter), child_state),
             )
 
+        maybe_record_trace(
+            "bound_update",
+            note="Updated global bound after branching",
+            node_depth=depth,
+        )
+
         best_bound = min(bound for bound, *_ in active_nodes) if active_nodes else node_lb
         if incumbent_obj is not None and mip_gap is not None:
             gap = relative_gap(incumbent_obj, best_bound)
@@ -2611,6 +2858,12 @@ def branch_and_price(
                         force=True,
                     )
                 status = "GAP_LIMIT"
+                maybe_record_trace(
+                    "gap_limit_reached",
+                    force=True,
+                    note="Reached requested relative gap target",
+                    node_depth=depth,
+                )
                 break
 
     if status == "UNKNOWN":
@@ -2621,12 +2874,28 @@ def branch_and_price(
         else:
             status = "OPTIMAL"
 
-    if active_nodes:
+    if root_lp_objective is None and nodes_processed == 0:
+        best_bound = None
+    elif active_nodes:
         best_bound = min(bound for bound, *_ in active_nodes)
     elif incumbent_obj is not None:
         best_bound = incumbent_obj
     else:
         best_bound = root_lp_objective
+
+    if trace_logger is not None:
+        trace_logger.record(
+            event="solve_end",
+            status=status,
+            incumbent_objective=incumbent_obj,
+            best_bound=best_bound,
+            relative_gap=relative_gap(incumbent_obj, best_bound),
+            nodes_processed=nodes_processed,
+            nodes_pruned=nodes_pruned,
+            global_columns=len(route_pool),
+            queue_size=len(active_nodes),
+            note="Branch-and-price finished",
+        )
 
     return BranchAndPriceResult(
         status=status,
@@ -2655,7 +2924,8 @@ def solve_model(
     max_bp_nodes: int | None,
     heuristic_time_limit: float | None = HEURISTIC_MASTER_TIME_LIMIT,
     progress: ProgressTracker | None = None,
-) -> None:
+    trace_logger: ObjectiveTraceLogger | None = None,
+) -> BranchAndPriceResult:
     instance = load_instance(workbook_path)
     result = branch_and_price(
         instance=instance,
@@ -2670,6 +2940,7 @@ def solve_model(
         max_bp_nodes=max_bp_nodes,
         heuristic_time_limit=heuristic_time_limit,
         progress=progress,
+        trace_logger=trace_logger,
     )
 
     print(f"Status: {result.status}")
@@ -2689,7 +2960,7 @@ def solve_model(
 
     if not result.selected_routes:
         print("No feasible incumbent route set found.")
-        return
+        return result
 
     usage_counter: dict[str, int] = defaultdict(int)
     for route in sorted(
@@ -2729,6 +3000,8 @@ def solve_model(
                 f"early {early:.1f} min, late {late:.1f} min"
             )
         print()
+
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -2836,10 +3109,26 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Minimum seconds between non-forced progress updates.",
     )
+    parser.add_argument(
+        "--objective-trace",
+        type=Path,
+        default=None,
+        help=(
+            "CSV path for incumbent and bound snapshots over time. "
+            "Default: auto-generate a timestamped file beside the workbook."
+        ),
+    )
+    parser.add_argument(
+        "--no-objective-trace",
+        action="store_true",
+        help="Disable writing the objective trace CSV.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    global _INTERRUPT_SIGNAL_NAME
+    _INTERRUPT_SIGNAL_NAME = None
     args = parse_args()
     heuristic_time_limit = HEURISTIC_MASTER_TIME_LIMIT
     if args.unlimited:
@@ -2853,20 +3142,52 @@ def main() -> None:
         enabled=args.progress,
         interval_seconds=args.progress_interval,
     )
-    solve_model(
-        workbook_path=args.workbook,
-        time_limit=args.time_limit,
-        mip_gap=args.mip_gap,
-        max_cg_iterations=args.max_cg_iterations,
-        pricing_time_limit=args.pricing_time_limit,
-        pricing_columns_per_type=args.pricing_columns_per_type,
-        pricing_workers=args.pricing_workers,
-        dual_stabilization_alpha=args.dual_stabilization_alpha,
-        dual_stabilization_mode=args.dual_stabilization_mode,
-        max_bp_nodes=args.max_bp_nodes,
-        heuristic_time_limit=heuristic_time_limit,
-        progress=progress,
+    objective_trace_path = (
+        None
+        if args.no_objective_trace
+        else (args.objective_trace or default_objective_trace_path(args.workbook))
     )
+    trace_logger = ObjectiveTraceLogger(objective_trace_path, args.workbook)
+    previous_handlers = install_interrupt_handlers()
+
+    try:
+        if trace_logger.path is not None:
+            print(f"Objective trace: {trace_logger.path}")
+            trace_logger.record(
+                event="run_start",
+                status="RUNNING",
+                note=f"Workbook: {args.workbook}",
+            )
+        solve_model(
+            workbook_path=args.workbook,
+            time_limit=args.time_limit,
+            mip_gap=args.mip_gap,
+            max_cg_iterations=args.max_cg_iterations,
+            pricing_time_limit=args.pricing_time_limit,
+            pricing_columns_per_type=args.pricing_columns_per_type,
+            pricing_workers=args.pricing_workers,
+            dual_stabilization_alpha=args.dual_stabilization_alpha,
+            dual_stabilization_mode=args.dual_stabilization_mode,
+            max_bp_nodes=args.max_bp_nodes,
+            heuristic_time_limit=heuristic_time_limit,
+            progress=progress,
+            trace_logger=trace_logger,
+        )
+    except KeyboardInterrupt:
+        interrupt_note = "Interrupted by user"
+        if _INTERRUPT_SIGNAL_NAME is not None:
+            interrupt_note = f"Interrupted by {_INTERRUPT_SIGNAL_NAME}"
+        if trace_logger.path is not None:
+            trace_logger.record(
+                event="interrupted",
+                status="INTERRUPTED",
+                note=interrupt_note,
+            )
+            print(f"\n{interrupt_note}. Partial objective trace saved to {trace_logger.path}")
+        raise SystemExit(130) from None
+    finally:
+        restore_interrupt_handlers(previous_handlers)
+        trace_logger.close()
 
 
 if __name__ == "__main__":
