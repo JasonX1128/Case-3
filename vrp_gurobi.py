@@ -168,6 +168,18 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     node_ids = [DEPOT_NODE] + stop_ids
     node_pairs = [(i, j) for i in node_ids for j in node_ids if i != j]
     arc_keys = [(v, i, j) for v in vehicle_ids for i, j in node_pairs]
+    identical_vehicle_groups: dict[tuple[Any, ...], list[int]] = {}
+    for v in vehicle_ids:
+        vehicle = instance.vehicles[v]
+        key = (
+            vehicle.vehicle_type,
+            vehicle.capacity_kg,
+            vehicle.cost_per_mile,
+            vehicle.fixed_daily_cost,
+            vehicle.available_from_min,
+            vehicle.available_until_min,
+        )
+        identical_vehicle_groups.setdefault(key, []).append(v)
 
     start_limit = {
         v: max(instance.vehicles[v].available_from_min, instance.depot_open_min)
@@ -295,6 +307,9 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     }
     starts = {v: gp.quicksum(x[v, DEPOT_NODE, j] for j in stop_ids) for v in vehicle_ids}
     returns = {v: gp.quicksum(x[v, i, DEPOT_NODE] for i in stop_ids) for v in vehicle_ids}
+    first_customer_index_expr = {
+        v: gp.quicksum(s * x[v, DEPOT_NODE, s] for s in stop_ids) for v in vehicle_ids
+    }
 
     drive_min_expr = {
         v: gp.quicksum(
@@ -342,6 +357,24 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             early_min[s] >= EARLY_FLAG_MINUTES * early_flag[s],
             name=f"early_flag_lower[{s}]",
         )
+
+    symmetry_group_count = 0
+    for group in identical_vehicle_groups.values():
+        sorted_group = sorted(group)
+        if len(sorted_group) <= 1:
+            continue
+        symmetry_group_count += 1
+        for prev_v, next_v in zip(sorted_group, sorted_group[1:]):
+            model.addConstr(
+                use_vehicle[prev_v] >= use_vehicle[next_v],
+                name=f"symmetry_use_order[{prev_v},{next_v}]",
+            )
+            model.addConstr(
+                first_customer_index_expr[prev_v]
+                <= first_customer_index_expr[next_v]
+                + len(stop_ids) * (2 - use_vehicle[prev_v] - use_vehicle[next_v]),
+                name=f"symmetry_first_customer[{prev_v},{next_v}]",
+            )
 
     for v in vehicle_ids:
         vehicle = instance.vehicles[v]
@@ -465,6 +498,7 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         "active_min_expr": active_min_expr,
         "distance_cost_expr": distance_cost_expr,
         "fixed_arc_count": fixed_arc_count,
+        "symmetry_group_count": symmetry_group_count,
         "node_ids": node_ids,
         "stop_ids": stop_ids,
         "vehicle_ids": vehicle_ids,
