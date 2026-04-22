@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time as dt_time
+from itertools import count
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import gurobipy as gp
@@ -14,6 +17,8 @@ from openpyxl import load_workbook
 
 DEPOT_NODE = 0
 REDUCED_COST_TOL = 1e-6
+INTEGRALITY_TOL = 1e-6
+HEURISTIC_MASTER_TIME_LIMIT = 5.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,7 @@ class RouteColumn:
     vehicle_type: str
     stop_sequence: tuple[int, ...]
     stop_set: frozenset[int]
+    arc_set: frozenset[tuple[int, int]]
     cost: float
     load_kg: float
     distance_mi: float
@@ -78,11 +84,43 @@ class RouteColumn:
 
 
 @dataclass(frozen=True)
-class ColumnGenerationResult:
-    vehicle_types: dict[str, VehicleTypeData]
+class BranchState:
+    forbidden_arcs: frozenset[tuple[int, int]]
+    forced_arcs: frozenset[tuple[int, int]]
+    excluded_assignments: frozenset[tuple[int, str]]
+    forced_assignments: frozenset[tuple[int, str]]
+
+
+@dataclass
+class BranchContext:
+    forbidden_arcs: frozenset[tuple[int, int]]
+    forced_arcs: tuple[tuple[int, int], ...]
+    forced_successor: dict[int, int]
+    forced_predecessor: dict[int, int]
+    forced_type_for_stop: dict[int, str]
+    excluded_types_by_stop: dict[int, set[str]]
+
+
+@dataclass
+class NodeRelaxationResult:
+    lower_bound: float
     routes: list[RouteColumn]
-    iterations: int
-    lp_objective: float
+    route_values: list[float]
+    cg_iterations: int
+
+
+@dataclass
+class BranchAndPriceResult:
+    status: str
+    objective: float | None
+    best_bound: float | None
+    gap: float | None
+    selected_routes: list[RouteColumn]
+    vehicle_types: dict[str, VehicleTypeData]
+    nodes_processed: int
+    nodes_pruned: int
+    global_columns: int
+    root_lp_objective: float | None
 
 
 def excel_time_to_minutes(value: Any) -> float:
@@ -90,7 +128,7 @@ def excel_time_to_minutes(value: Any) -> float:
         raise ValueError("Encountered an empty time value.")
     if isinstance(value, datetime):
         return value.hour * 60 + value.minute + value.second / 60
-    if isinstance(value, time):
+    if isinstance(value, dt_time):
         return value.hour * 60 + value.minute + value.second / 60
     if isinstance(value, (int, float)):
         if 0 <= value <= 2:
@@ -115,6 +153,31 @@ def minutes_to_clock(minutes: float) -> str:
     total_minutes = int(round(minutes))
     hours, mins = divmod(total_minutes, 60)
     return f"{hours:02d}:{mins:02d}"
+
+
+def remaining_time(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(deadline - perf_counter(), 0.0)
+
+
+def relative_gap(incumbent: float | None, best_bound: float | None) -> float | None:
+    if incumbent is None or best_bound is None:
+        return None
+    if abs(incumbent) <= INTEGRALITY_TOL:
+        return 0.0 if abs(incumbent - best_bound) <= INTEGRALITY_TOL else None
+    return max(incumbent - best_bound, 0.0) / abs(incumbent)
+
+
+def route_arc_set(stop_sequence: tuple[int, ...]) -> frozenset[tuple[int, int]]:
+    if not stop_sequence:
+        return frozenset()
+
+    arcs: list[tuple[int, int]] = [(DEPOT_NODE, stop_sequence[0])]
+    for idx in range(len(stop_sequence) - 1):
+        arcs.append((stop_sequence[idx], stop_sequence[idx + 1]))
+    arcs.append((stop_sequence[-1], DEPOT_NODE))
+    return frozenset(arcs)
 
 
 def load_instance(workbook_path: Path) -> Instance:
@@ -197,7 +260,7 @@ def validate_route_based_assumptions(instance: Instance) -> None:
     early_penalty = instance.cost_params.get("Early_Delivery_Penalty", 0.0)
     if abs(early_penalty) > 1e-9:
         raise NotImplementedError(
-            "This route-based rewrite currently assumes zero early-delivery penalty. "
+            "This branch-and-price model currently assumes zero early-delivery penalty. "
             "That matches the workbook scenario, where Early_Delivery_Penalty = 0."
         )
 
@@ -219,7 +282,14 @@ def build_vehicle_types(instance: Instance) -> dict[str, VehicleTypeData]:
     for idx, (key, vehicle_ids) in enumerate(
         sorted(grouped.items(), key=lambda item: min(item[1])), start=1
     ):
-        vehicle_type, capacity_kg, cost_per_mile, fixed_daily_cost, available_from_min, available_until_min = key
+        (
+            vehicle_type,
+            capacity_kg,
+            cost_per_mile,
+            fixed_daily_cost,
+            available_from_min,
+            available_until_min,
+        ) = key
         type_id = f"T{idx}"
         vehicle_types[type_id] = VehicleTypeData(
             type_id=type_id,
@@ -304,6 +374,7 @@ def evaluate_route_sequence(
         vehicle_type=vehicle_type.vehicle_type,
         stop_sequence=stop_sequence,
         stop_set=frozenset(stop_sequence),
+        arc_set=route_arc_set(stop_sequence),
         cost=cost,
         load_kg=load_kg,
         distance_mi=distance_mi,
@@ -312,26 +383,6 @@ def evaluate_route_sequence(
         service_start_min=service_start_min,
         late_min=late_min,
     )
-
-
-def initial_routes(
-    instance: Instance,
-    vehicle_types: dict[str, VehicleTypeData],
-) -> list[RouteColumn]:
-    routes: list[RouteColumn] = []
-    for vehicle_type in vehicle_types.values():
-        for stop_id in sorted(instance.stops):
-            route = evaluate_route_sequence(instance, vehicle_type, (stop_id,))
-            if route is not None:
-                routes.append(route)
-
-    route_keys = {(route.type_id, route.stop_sequence) for route in routes}
-    for route in construct_seed_partition_routes(instance, vehicle_types):
-        key = (route.type_id, route.stop_sequence)
-        if key not in route_keys:
-            route_keys.add(key)
-            routes.append(route)
-    return routes
 
 
 def best_stop_insertion(
@@ -452,12 +503,130 @@ def construct_seed_partition_routes(
     return []
 
 
+def initial_routes(
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+) -> list[RouteColumn]:
+    routes: list[RouteColumn] = []
+    for vehicle_type in vehicle_types.values():
+        for stop_id in sorted(instance.stops):
+            route = evaluate_route_sequence(instance, vehicle_type, (stop_id,))
+            if route is not None:
+                routes.append(route)
+
+    route_keys = {(route.type_id, route.stop_sequence) for route in routes}
+    for route in construct_seed_partition_routes(instance, vehicle_types):
+        key = (route.type_id, route.stop_sequence)
+        if key not in route_keys:
+            route_keys.add(key)
+            routes.append(route)
+    return routes
+
+
+def build_branch_context(
+    branch_state: BranchState,
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+) -> BranchContext | None:
+    forced_successor: dict[int, int] = {}
+    forced_predecessor: dict[int, int] = {}
+    forced_type_for_stop: dict[int, str] = {}
+    excluded_types_by_stop: dict[int, set[str]] = defaultdict(set)
+
+    for arc in branch_state.forced_arcs:
+        if arc in branch_state.forbidden_arcs:
+            return None
+        i, j = arc
+        if i == DEPOT_NODE and j == DEPOT_NODE:
+            return None
+        if i != DEPOT_NODE:
+            existing = forced_successor.get(i)
+            if existing is not None and existing != j:
+                return None
+            forced_successor[i] = j
+        if j != DEPOT_NODE:
+            existing = forced_predecessor.get(j)
+            if existing is not None and existing != i:
+                return None
+            forced_predecessor[j] = i
+
+    for start_node in forced_successor:
+        seen: set[int] = set()
+        current = start_node
+        while current != DEPOT_NODE and current in forced_successor:
+            if current in seen:
+                return None
+            seen.add(current)
+            next_node = forced_successor[current]
+            if next_node == DEPOT_NODE:
+                break
+            current = next_node
+
+    for stop_id, type_id in branch_state.forced_assignments:
+        if type_id not in vehicle_types:
+            return None
+        existing = forced_type_for_stop.get(stop_id)
+        if existing is not None and existing != type_id:
+            return None
+        forced_type_for_stop[stop_id] = type_id
+
+    for stop_id, type_id in branch_state.excluded_assignments:
+        if type_id not in vehicle_types:
+            return None
+        excluded_types_by_stop[stop_id].add(type_id)
+
+    all_type_ids = set(vehicle_types)
+    for stop_id, type_id in forced_type_for_stop.items():
+        if type_id in excluded_types_by_stop[stop_id]:
+            return None
+    for stop_id in instance.stops:
+        if stop_id not in forced_type_for_stop and excluded_types_by_stop.get(stop_id) == all_type_ids:
+            return None
+
+    return BranchContext(
+        forbidden_arcs=branch_state.forbidden_arcs,
+        forced_arcs=tuple(sorted(branch_state.forced_arcs)),
+        forced_successor=forced_successor,
+        forced_predecessor=forced_predecessor,
+        forced_type_for_stop=forced_type_for_stop,
+        excluded_types_by_stop=excluded_types_by_stop,
+    )
+
+
+def route_is_compatible(route: RouteColumn, branch_ctx: BranchContext) -> bool:
+    if route.arc_set & branch_ctx.forbidden_arcs:
+        return False
+
+    for stop_id, forced_type in branch_ctx.forced_type_for_stop.items():
+        if stop_id in route.stop_set and route.type_id != forced_type:
+            return False
+
+    for stop_id, excluded_types in branch_ctx.excluded_types_by_stop.items():
+        if route.type_id in excluded_types and stop_id in route.stop_set:
+            return False
+
+    for i, j in branch_ctx.forced_arcs:
+        if i == DEPOT_NODE:
+            if j in route.stop_set and (i, j) not in route.arc_set:
+                return False
+        elif j == DEPOT_NODE:
+            if i in route.stop_set and (i, j) not in route.arc_set:
+                return False
+        else:
+            if (i in route.stop_set or j in route.stop_set) and (i, j) not in route.arc_set:
+                return False
+
+    return True
+
+
 def solve_pricing_subproblem(
     instance: Instance,
     vehicle_type: VehicleTypeData,
     cover_duals: dict[int, float],
     type_dual: float,
+    branch_ctx: BranchContext,
     pricing_time_limit: float | None,
+    deadline: float | None,
 ) -> RouteColumn | None:
     stop_ids = sorted(instance.stops)
     start_limit = vehicle_start_limit(instance, vehicle_type)
@@ -474,19 +643,31 @@ def solve_pricing_subproblem(
         stop = instance.stops[stop_id]
         lb = start_limit + instance.travel_minutes[DEPOT_NODE, stop_id]
         ub = end_limit - stop.service_min - instance.travel_minutes[stop_id, DEPOT_NODE]
-        feasible = stop.demand_kg <= vehicle_type.capacity_kg and lb <= ub
+        assignment_allowed = True
+        forced_type = branch_ctx.forced_type_for_stop.get(stop_id)
+        if forced_type is not None and forced_type != vehicle_type.type_id:
+            assignment_allowed = False
+        if vehicle_type.type_id in branch_ctx.excluded_types_by_stop.get(stop_id, set()):
+            assignment_allowed = False
+
+        feasible = (
+            assignment_allowed
+            and stop.demand_kg <= vehicle_type.capacity_kg
+            and lb <= ub
+        )
         stop_lb[stop_id] = lb
         stop_ub[stop_id] = ub
         feasible_stop[stop_id] = feasible
         late_ub[stop_id] = max(ub - stop.latest_min, 0.0) if feasible else 0.0
 
-    arc_keys: list[tuple[int, int]] = []
     if route_horizon <= 0:
         return None
 
+    arc_keys: list[tuple[int, int]] = []
     for stop_id in stop_ids:
-        if feasible_stop[stop_id]:
+        if feasible_stop[stop_id] and (DEPOT_NODE, stop_id) not in branch_ctx.forbidden_arcs:
             arc_keys.append((DEPOT_NODE, stop_id))
+        if feasible_stop[stop_id] and (stop_id, DEPOT_NODE) not in branch_ctx.forbidden_arcs:
             arc_keys.append((stop_id, DEPOT_NODE))
 
     for i in stop_ids:
@@ -494,6 +675,8 @@ def solve_pricing_subproblem(
             continue
         for j in stop_ids:
             if i == j or not feasible_stop[j]:
+                continue
+            if (i, j) in branch_ctx.forbidden_arcs:
                 continue
             if (
                 stop_lb[i]
@@ -508,8 +691,19 @@ def solve_pricing_subproblem(
 
     pricing = gp.Model(f"pricing_{vehicle_type.type_id}")
     pricing.Params.OutputFlag = 0
-    if pricing_time_limit is not None:
-        pricing.Params.TimeLimit = pricing_time_limit
+    deadline_limit = remaining_time(deadline)
+    if deadline_limit is not None:
+        if deadline_limit <= 0:
+            raise TimeoutError("Overall time limit reached during pricing.")
+    effective_time_limit = pricing_time_limit
+    if deadline_limit is not None:
+        effective_time_limit = (
+            min(deadline_limit, pricing_time_limit)
+            if pricing_time_limit is not None
+            else deadline_limit
+        )
+    if effective_time_limit is not None:
+        pricing.Params.TimeLimit = effective_time_limit
 
     x = pricing.addVars(arc_keys, vtype=GRB.BINARY, name="x")
     y = pricing.addVars(stop_ids, vtype=GRB.BINARY, name="y")
@@ -518,9 +712,7 @@ def solve_pricing_subproblem(
     route_used = pricing.addVar(vtype=GRB.BINARY, name="route_used")
     return_min = pricing.addVar(lb=0.0, ub=end_limit, name="return_min")
     active_min = pricing.addVar(lb=0.0, ub=route_horizon, name="active_min")
-    regular_min = pricing.addVar(
-        lb=0.0, ub=route_used_max_regular, name="regular_min"
-    )
+    regular_min = pricing.addVar(lb=0.0, ub=route_used_max_regular, name="regular_min")
     overtime_min = pricing.addVar(lb=0.0, ub=route_horizon, name="overtime_min")
 
     outgoing = {
@@ -613,6 +805,29 @@ def solve_pricing_subproblem(
             name=f"time_link[{i},{j}]",
         )
 
+    for i, j in branch_ctx.forced_arcs:
+        if i == DEPOT_NODE:
+            if feasible_stop[j]:
+                if (i, j) in x:
+                    pricing.addConstr(x[i, j] == y[j], name=f"force_arc[{i},{j}]")
+                else:
+                    pricing.addConstr(y[j] == 0, name=f"force_off[{i},{j}]")
+        elif j == DEPOT_NODE:
+            if feasible_stop[i]:
+                if (i, j) in x:
+                    pricing.addConstr(x[i, j] == y[i], name=f"force_arc[{i},{j}]")
+                else:
+                    pricing.addConstr(y[i] == 0, name=f"force_off[{i},{j}]")
+        else:
+            if feasible_stop[i] and feasible_stop[j] and (i, j) in x:
+                pricing.addConstr(x[i, j] == y[i], name=f"force_succ[{i},{j}]")
+                pricing.addConstr(x[i, j] == y[j], name=f"force_pred[{i},{j}]")
+            else:
+                if feasible_stop[i]:
+                    pricing.addConstr(y[i] == 0, name=f"force_stop_off[{i}]")
+                if feasible_stop[j]:
+                    pricing.addConstr(y[j] == 0, name=f"force_stop_off[{j}]")
+
     pricing.addConstr(
         gp.quicksum(instance.stops[s].demand_kg * y[s] for s in stop_ids)
         <= vehicle_type.capacity_kg * route_used,
@@ -661,13 +876,19 @@ def solve_pricing_subproblem(
     pricing.setObjective(reduced_cost_objective, GRB.MINIMIZE)
     pricing.optimize()
 
-    if pricing.Status not in {GRB.OPTIMAL, GRB.TIME_LIMIT}:
+    if pricing.Status == GRB.TIME_LIMIT:
+        if deadline_limit is not None and (
+            pricing_time_limit is None or deadline_limit <= pricing_time_limit + 1e-9
+        ):
+            raise TimeoutError("Overall time limit reached during pricing.")
+        raise RuntimeError(
+            "A pricing subproblem hit the user pricing time limit before optimality. "
+            "Exact branch-and-price requires optimal pricing solves."
+        )
+    if pricing.Status != GRB.OPTIMAL:
         raise RuntimeError(
             f"Pricing problem for {vehicle_type.type_id} failed with status {pricing.Status}."
         )
-
-    if pricing.SolCount == 0:
-        return None
 
     if route_used.X < 0.5 or pricing.ObjVal >= -REDUCED_COST_TOL:
         return None
@@ -689,6 +910,10 @@ def solve_pricing_subproblem(
         raise RuntimeError(
             f"Pricing returned an invalid route for {vehicle_type.type_id}: {sequence}"
         )
+    if not route_is_compatible(route, branch_ctx):
+        raise RuntimeError(
+            f"Pricing returned a branch-incompatible route for {vehicle_type.type_id}: {sequence}"
+        )
     return route
 
 
@@ -699,7 +924,7 @@ def build_master_model(
     relax: bool,
     allow_artificial: bool = False,
 ) -> tuple[gp.Model, dict[str, Any]]:
-    model = gp.Model("route_based_vrp")
+    model = gp.Model("route_based_master")
     model.Params.OutputFlag = 0
 
     route_indices = list(range(len(routes)))
@@ -755,39 +980,50 @@ def build_master_model(
     model._data = {
         "route_vars": route_vars,
         "artificial_vars": artificial_vars,
-        "artificial_penalty": artificial_penalty if allow_artificial else None,
-        "routes": routes,
-        "vehicle_types": vehicle_types,
         "cover_constraints": cover_constraints,
         "type_constraints": type_constraints,
-        "formulation": "route_set_partitioning",
+        "routes": routes,
+        "vehicle_types": vehicle_types,
     }
     return model, model._data
 
 
-def generate_route_columns(
+def solve_node_relaxation(
     instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    route_pool: list[RouteColumn],
+    route_key_set: set[tuple[str, tuple[int, ...]]],
+    branch_state: BranchState,
     max_cg_iterations: int,
     pricing_time_limit: float | None,
-) -> ColumnGenerationResult:
-    validate_route_based_assumptions(instance)
-    vehicle_types = build_vehicle_types(instance)
-    routes = initial_routes(instance, vehicle_types)
-    route_keys = {(route.type_id, route.stop_sequence) for route in routes}
+    deadline: float | None,
+) -> NodeRelaxationResult | None:
+    branch_ctx = build_branch_context(branch_state, instance, vehicle_types)
+    if branch_ctx is None:
+        return None
+
+    compatible_routes = [route for route in route_pool if route_is_compatible(route, branch_ctx)]
     last_lp_objective = float("nan")
 
     for iteration in range(1, max_cg_iterations + 1):
         master_lp, lp_data = build_master_model(
-            instance,
-            vehicle_types,
-            routes,
+            instance=instance,
+            vehicle_types=vehicle_types,
+            routes=compatible_routes,
             relax=True,
             allow_artificial=True,
         )
+        master_time_limit = remaining_time(deadline)
+        if master_time_limit is not None:
+            if master_time_limit <= 0:
+                raise TimeoutError("Overall time limit reached during node LP.")
+            master_lp.Params.TimeLimit = master_time_limit
         master_lp.optimize()
+        if master_lp.Status == GRB.TIME_LIMIT:
+            raise TimeoutError("Overall time limit reached during node LP.")
         if master_lp.Status != GRB.OPTIMAL:
             raise RuntimeError(
-                f"Column-generation master LP did not solve to optimality (status {master_lp.Status})."
+                f"Column-generation node LP did not solve to optimality (status {master_lp.Status})."
             )
 
         last_lp_objective = master_lp.ObjVal
@@ -805,67 +1041,440 @@ def generate_route_columns(
                 vehicle_type=vehicle_type,
                 cover_duals=cover_duals,
                 type_dual=type_duals[vehicle_type.type_id],
+                branch_ctx=branch_ctx,
                 pricing_time_limit=pricing_time_limit,
+                deadline=deadline,
             )
             if route is None:
                 continue
             key = (route.type_id, route.stop_sequence)
-            if key not in route_keys:
-                route_keys.add(key)
+            if key not in route_key_set:
+                route_key_set.add(key)
+                route_pool.append(route)
+                compatible_routes.append(route)
                 new_routes.append(route)
 
         if not new_routes:
             artificial_usage = sum(
                 lp_data["artificial_vars"][stop_id].X for stop_id in sorted(instance.stops)
             )
-            if artificial_usage > 1e-6:
-                raise RuntimeError(
-                    "Column generation stopped with artificial stop coverage still in use. "
-                    "The route pool is not rich enough yet to represent a full solution."
-                )
-            return ColumnGenerationResult(
-                vehicle_types=vehicle_types,
-                routes=routes,
-                iterations=iteration,
-                lp_objective=last_lp_objective,
+            if artificial_usage > INTEGRALITY_TOL:
+                return None
+            route_values = [
+                lp_data["route_vars"][idx].X for idx in range(len(compatible_routes))
+            ]
+            return NodeRelaxationResult(
+                lower_bound=last_lp_objective,
+                routes=compatible_routes,
+                route_values=route_values,
+                cg_iterations=iteration,
             )
 
-        routes.extend(new_routes)
+    raise RuntimeError(
+        "Maximum column-generation iterations reached before node convergence. "
+        "Increase --max-cg-iterations for an exact solve."
+    )
 
-    return ColumnGenerationResult(
+
+def solve_restricted_integer_master(
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    routes: list[RouteColumn],
+    deadline: float | None,
+    heuristic_time_limit: float | None,
+) -> tuple[float, list[RouteColumn]] | None:
+    if not routes:
+        return None
+
+    model, data = build_master_model(
+        instance=instance,
         vehicle_types=vehicle_types,
         routes=routes,
-        iterations=max_cg_iterations,
-        lp_objective=last_lp_objective,
+        relax=False,
+        allow_artificial=False,
     )
+
+    effective_time_limit = heuristic_time_limit
+    remaining = remaining_time(deadline)
+    if remaining is not None:
+        if remaining <= 0:
+            raise TimeoutError("Overall time limit reached during restricted master heuristic.")
+        effective_time_limit = (
+            min(heuristic_time_limit, remaining)
+            if heuristic_time_limit is not None
+            else remaining
+        )
+    if effective_time_limit is not None:
+        model.Params.TimeLimit = effective_time_limit
+
+    model.optimize()
+    if model.Status == GRB.TIME_LIMIT and model.SolCount == 0:
+        return None
+    if model.SolCount == 0:
+        return None
+
+    route_vars = data["route_vars"]
+    selected_routes = [routes[idx] for idx in range(len(routes)) if route_vars[idx].X > 0.5]
+    return model.ObjVal, selected_routes
+
+
+def is_integral_solution(route_values: list[float]) -> bool:
+    return all(abs(value - round(value)) <= INTEGRALITY_TOL for value in route_values)
+
+
+def compute_arc_values(
+    routes: list[RouteColumn],
+    route_values: list[float],
+) -> dict[tuple[int, int], float]:
+    arc_values: dict[tuple[int, int], float] = defaultdict(float)
+    for route, value in zip(routes, route_values):
+        if value <= INTEGRALITY_TOL:
+            continue
+        for arc in route.arc_set:
+            arc_values[arc] += value
+    return arc_values
+
+
+def compute_assignment_values(
+    routes: list[RouteColumn],
+    route_values: list[float],
+) -> dict[tuple[int, str], float]:
+    assignment_values: dict[tuple[int, str], float] = defaultdict(float)
+    for route, value in zip(routes, route_values):
+        if value <= INTEGRALITY_TOL:
+            continue
+        for stop_id in route.stop_sequence:
+            assignment_values[stop_id, route.type_id] += value
+    return assignment_values
+
+
+def select_fractional_arc(
+    routes: list[RouteColumn],
+    route_values: list[float],
+    branch_ctx: BranchContext,
+) -> tuple[int, int] | None:
+    fixed_arcs = set(branch_ctx.forced_arcs) | set(branch_ctx.forbidden_arcs)
+    best_arc: tuple[int, int] | None = None
+    best_score: tuple[int, float] | None = None
+
+    for arc, value in compute_arc_values(routes, route_values).items():
+        if arc in fixed_arcs:
+            continue
+        if not (INTEGRALITY_TOL < value < 1.0 - INTEGRALITY_TOL):
+            continue
+        score = (1 if DEPOT_NODE in arc else 0, abs(value - 0.5))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_arc = arc
+
+    return best_arc
+
+
+def select_fractional_assignment(
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    routes: list[RouteColumn],
+    route_values: list[float],
+    branch_ctx: BranchContext,
+) -> tuple[int, str] | None:
+    assignment_values = compute_assignment_values(routes, route_values)
+    best_assignment: tuple[int, str] | None = None
+    best_score: float | None = None
+
+    for stop_id in sorted(instance.stops):
+        if stop_id in branch_ctx.forced_type_for_stop:
+            continue
+        for type_id in sorted(vehicle_types):
+            if type_id in branch_ctx.excluded_types_by_stop.get(stop_id, set()):
+                continue
+            value = assignment_values.get((stop_id, type_id), 0.0)
+            if not (INTEGRALITY_TOL < value < 1.0 - INTEGRALITY_TOL):
+                continue
+            score = abs(value - 0.5)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_assignment = (stop_id, type_id)
+
+    return best_assignment
 
 
 def create_model(
     workbook_path: Path,
-    max_cg_iterations: int = 50,
+    max_cg_iterations: int = 200,
     pricing_time_limit: float | None = None,
 ) -> tuple[gp.Model, dict[str, Any]]:
     instance = load_instance(workbook_path)
-    cg_result = generate_route_columns(
+    validate_route_based_assumptions(instance)
+    vehicle_types = build_vehicle_types(instance)
+    route_pool = initial_routes(instance, vehicle_types)
+    route_key_set = {(route.type_id, route.stop_sequence) for route in route_pool}
+    root_state = BranchState(
+        forbidden_arcs=frozenset(),
+        forced_arcs=frozenset(),
+        excluded_assignments=frozenset(),
+        forced_assignments=frozenset(),
+    )
+    root_result = solve_node_relaxation(
         instance=instance,
+        vehicle_types=vehicle_types,
+        route_pool=route_pool,
+        route_key_set=route_key_set,
+        branch_state=root_state,
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
+        deadline=None,
     )
+    if root_result is None:
+        raise RuntimeError("The root branch-and-price node is infeasible.")
+
     model, data = build_master_model(
         instance=instance,
-        vehicle_types=cg_result.vehicle_types,
-        routes=cg_result.routes,
+        vehicle_types=vehicle_types,
+        routes=root_result.routes,
         relax=False,
+        allow_artificial=False,
     )
     data.update(
         {
             "instance": instance,
-            "cg_iterations": cg_result.iterations,
-            "lp_objective": cg_result.lp_objective,
-            "column_count": len(cg_result.routes),
+            "cg_iterations": root_result.cg_iterations,
+            "lp_objective": root_result.lower_bound,
+            "column_count": len(root_result.routes),
+            "note": (
+                "This is the root restricted master over generated columns. "
+                "Exact solves happen through solve_model(), which runs branch-and-price."
+            ),
         }
     )
     return model, data
+
+
+def branch_and_price(
+    instance: Instance,
+    time_limit: float | None,
+    mip_gap: float | None,
+    max_cg_iterations: int,
+    pricing_time_limit: float | None,
+    max_bp_nodes: int | None,
+) -> BranchAndPriceResult:
+    validate_route_based_assumptions(instance)
+    vehicle_types = build_vehicle_types(instance)
+    route_pool = initial_routes(instance, vehicle_types)
+    route_key_set = {(route.type_id, route.stop_sequence) for route in route_pool}
+
+    root_state = BranchState(
+        forbidden_arcs=frozenset(),
+        forced_arcs=frozenset(),
+        excluded_assignments=frozenset(),
+        forced_assignments=frozenset(),
+    )
+
+    deadline = perf_counter() + time_limit if time_limit is not None else None
+    active_nodes: list[tuple[float, int, int, BranchState]] = []
+    sequence_counter = count()
+    heapq.heappush(active_nodes, (0.0, 0, next(sequence_counter), root_state))
+
+    incumbent_obj: float | None = None
+    incumbent_routes: list[RouteColumn] = []
+    root_lp_objective: float | None = None
+    nodes_processed = 0
+    nodes_pruned = 0
+    status = "UNKNOWN"
+
+    try:
+        initial_heuristic = solve_restricted_integer_master(
+            instance=instance,
+            vehicle_types=vehicle_types,
+            routes=route_pool,
+            deadline=deadline,
+            heuristic_time_limit=HEURISTIC_MASTER_TIME_LIMIT,
+        )
+    except TimeoutError:
+        initial_heuristic = None
+    if initial_heuristic is not None:
+        incumbent_obj, incumbent_routes = initial_heuristic
+
+    while active_nodes:
+        if max_bp_nodes is not None and nodes_processed >= max_bp_nodes:
+            status = "NODE_LIMIT"
+            break
+        if deadline is not None and remaining_time(deadline) <= 0:
+            status = "TIME_LIMIT"
+            break
+
+        lower_bound_hint, depth, _, branch_state = heapq.heappop(active_nodes)
+        if incumbent_obj is not None and lower_bound_hint >= incumbent_obj - INTEGRALITY_TOL:
+            nodes_pruned += 1
+            continue
+
+        try:
+            node_result = solve_node_relaxation(
+                instance=instance,
+                vehicle_types=vehicle_types,
+                route_pool=route_pool,
+                route_key_set=route_key_set,
+                branch_state=branch_state,
+                max_cg_iterations=max_cg_iterations,
+                pricing_time_limit=pricing_time_limit,
+                deadline=deadline,
+            )
+        except TimeoutError:
+            heapq.heappush(
+                active_nodes,
+                (lower_bound_hint, depth, next(sequence_counter), branch_state),
+            )
+            status = "TIME_LIMIT"
+            break
+
+        nodes_processed += 1
+        if node_result is None:
+            continue
+        if root_lp_objective is None:
+            root_lp_objective = node_result.lower_bound
+
+        node_lb = node_result.lower_bound
+        if incumbent_obj is not None and node_lb >= incumbent_obj - INTEGRALITY_TOL:
+            nodes_pruned += 1
+            continue
+
+        heuristic_obj: float | None = None
+        if nodes_processed == 1 or incumbent_obj is None:
+            try:
+                heuristic_solution = solve_restricted_integer_master(
+                    instance=instance,
+                    vehicle_types=vehicle_types,
+                    routes=node_result.routes,
+                    deadline=deadline,
+                    heuristic_time_limit=HEURISTIC_MASTER_TIME_LIMIT,
+                )
+            except TimeoutError:
+                heapq.heappush(
+                    active_nodes,
+                    (node_lb, depth, next(sequence_counter), branch_state),
+                )
+                status = "TIME_LIMIT"
+                break
+            if heuristic_solution is not None:
+                heuristic_obj, heuristic_routes = heuristic_solution
+                if incumbent_obj is None or heuristic_obj < incumbent_obj - INTEGRALITY_TOL:
+                    incumbent_obj = heuristic_obj
+                    incumbent_routes = heuristic_routes
+
+        if is_integral_solution(node_result.route_values):
+            selected_routes = [
+                route
+                for route, value in zip(node_result.routes, node_result.route_values)
+                if value > 0.5
+            ]
+            if incumbent_obj is None or node_lb < incumbent_obj - INTEGRALITY_TOL:
+                incumbent_obj = node_lb
+                incumbent_routes = selected_routes
+            continue
+
+        if heuristic_obj is not None and abs(heuristic_obj - node_lb) <= 1e-5:
+            continue
+
+        branch_ctx = build_branch_context(branch_state, instance, vehicle_types)
+        if branch_ctx is None:
+            continue
+
+        child_states: list[BranchState] = []
+        branch_arc = select_fractional_arc(
+            routes=node_result.routes,
+            route_values=node_result.route_values,
+            branch_ctx=branch_ctx,
+        )
+        if branch_arc is not None:
+            child_states = [
+                BranchState(
+                    forbidden_arcs=frozenset(set(branch_state.forbidden_arcs) | {branch_arc}),
+                    forced_arcs=branch_state.forced_arcs,
+                    excluded_assignments=branch_state.excluded_assignments,
+                    forced_assignments=branch_state.forced_assignments,
+                ),
+                BranchState(
+                    forbidden_arcs=branch_state.forbidden_arcs,
+                    forced_arcs=frozenset(set(branch_state.forced_arcs) | {branch_arc}),
+                    excluded_assignments=branch_state.excluded_assignments,
+                    forced_assignments=branch_state.forced_assignments,
+                ),
+            ]
+        else:
+            branch_assignment = select_fractional_assignment(
+                instance=instance,
+                vehicle_types=vehicle_types,
+                routes=node_result.routes,
+                route_values=node_result.route_values,
+                branch_ctx=branch_ctx,
+            )
+            if branch_assignment is not None:
+                stop_id, type_id = branch_assignment
+                child_states = [
+                    BranchState(
+                        forbidden_arcs=branch_state.forbidden_arcs,
+                        forced_arcs=branch_state.forced_arcs,
+                        excluded_assignments=frozenset(
+                            set(branch_state.excluded_assignments) | {(stop_id, type_id)}
+                        ),
+                        forced_assignments=branch_state.forced_assignments,
+                    ),
+                    BranchState(
+                        forbidden_arcs=branch_state.forbidden_arcs,
+                        forced_arcs=branch_state.forced_arcs,
+                        excluded_assignments=branch_state.excluded_assignments,
+                        forced_assignments=frozenset(
+                            set(branch_state.forced_assignments) | {(stop_id, type_id)}
+                        ),
+                    ),
+                ]
+
+        if not child_states:
+            raise RuntimeError(
+                "Branch-and-price could not find a valid branching object on a fractional node."
+            )
+
+        for child_state in child_states:
+            if build_branch_context(child_state, instance, vehicle_types) is None:
+                continue
+            heapq.heappush(
+                active_nodes,
+                (node_lb, depth + 1, next(sequence_counter), child_state),
+            )
+
+        best_bound = min(bound for bound, *_ in active_nodes) if active_nodes else node_lb
+        if incumbent_obj is not None and mip_gap is not None:
+            gap = relative_gap(incumbent_obj, best_bound)
+            if gap is not None and gap <= mip_gap + 1e-12:
+                status = "GAP_LIMIT"
+                break
+
+    if status == "UNKNOWN":
+        if active_nodes:
+            status = "TIME_LIMIT" if deadline is not None and remaining_time(deadline) <= 0 else "NODE_LIMIT"
+        elif incumbent_obj is None:
+            status = "INFEASIBLE"
+        else:
+            status = "OPTIMAL"
+
+    if active_nodes:
+        best_bound = min(bound for bound, *_ in active_nodes)
+    elif incumbent_obj is not None:
+        best_bound = incumbent_obj
+    else:
+        best_bound = root_lp_objective
+
+    return BranchAndPriceResult(
+        status=status,
+        objective=incumbent_obj,
+        best_bound=best_bound,
+        gap=relative_gap(incumbent_obj, best_bound),
+        selected_routes=incumbent_routes,
+        vehicle_types=vehicle_types,
+        nodes_processed=nodes_processed,
+        nodes_pruned=nodes_pruned,
+        global_columns=len(route_pool),
+        root_lp_objective=root_lp_objective,
+    )
 
 
 def solve_model(
@@ -874,46 +1483,43 @@ def solve_model(
     mip_gap: float | None,
     max_cg_iterations: int,
     pricing_time_limit: float | None,
+    max_bp_nodes: int | None,
 ) -> None:
-    model, data = create_model(
-        workbook_path=workbook_path,
+    instance = load_instance(workbook_path)
+    result = branch_and_price(
+        instance=instance,
+        time_limit=time_limit,
+        mip_gap=mip_gap,
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
+        max_bp_nodes=max_bp_nodes,
     )
-    instance: Instance = data["instance"]
-    route_vars = data["route_vars"]
-    routes: list[RouteColumn] = data["routes"]
-    vehicle_types: dict[str, VehicleTypeData] = data["vehicle_types"]
 
-    if time_limit is not None:
-        model.Params.TimeLimit = time_limit
-    if mip_gap is not None:
-        model.Params.MIPGap = mip_gap
-
-    model.Params.OutputFlag = 1
-    model.optimize()
-
-    if model.SolCount == 0:
-        print(f"Status: {model.Status}")
-        print("No feasible solution found.")
-        return
-
-    print(f"Status: {model.Status}")
-    print("Formulation: Route-Based Set Partitioning")
-    print(f"Columns generated: {data['column_count']}")
-    print(f"Column generation iterations: {data['cg_iterations']}")
-    print(f"Master LP objective: {data['lp_objective']:.2f}")
-    print(f"Objective value: {model.ObjVal:.2f}")
+    print(f"Status: {result.status}")
+    print("Formulation: Branch-and-Price Set Partitioning")
+    print(f"Columns generated: {result.global_columns}")
+    print(f"Nodes processed: {result.nodes_processed}")
+    print(f"Nodes pruned: {result.nodes_pruned}")
+    if result.root_lp_objective is not None:
+        print(f"Root LP objective: {result.root_lp_objective:.2f}")
+    if result.best_bound is not None:
+        print(f"Best bound: {result.best_bound:.2f}")
+    if result.objective is not None:
+        print(f"Objective value: {result.objective:.2f}")
+    if result.gap is not None:
+        print(f"Relative gap: {100.0 * result.gap:.2f}%")
     print()
 
-    selected_routes = [routes[idx] for idx in range(len(routes)) if route_vars[idx].X > 0.5]
-    usage_counter: dict[str, int] = defaultdict(int)
+    if not result.selected_routes:
+        print("No feasible incumbent route set found.")
+        return
 
+    usage_counter: dict[str, int] = defaultdict(int)
     for route in sorted(
-        selected_routes,
-        key=lambda route: (route.type_id, route.return_min, route.stop_sequence),
+        result.selected_routes,
+        key=lambda candidate: (candidate.type_id, candidate.return_min, candidate.stop_sequence),
     ):
-        vehicle_type = vehicle_types[route.type_id]
+        vehicle_type = result.vehicle_types[route.type_id]
         usage_counter[route.type_id] += 1
         vehicle_position = usage_counter[route.type_id] - 1
         vehicle_id = vehicle_type.vehicle_ids[vehicle_position]
@@ -951,8 +1557,8 @@ def solve_model(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Solve the workbook-driven VRP with a route-based set-partitioning formulation "
-            "generated through column generation."
+            "Solve the workbook-driven VRP with an exact branch-and-price algorithm "
+            "over a route-based set-partitioning master problem."
         )
     )
     parser.add_argument(
@@ -965,25 +1571,34 @@ def parse_args() -> argparse.Namespace:
         "--time-limit",
         type=float,
         default=None,
-        help="Optional Gurobi time limit in seconds for the final master MIP.",
+        help="Optional overall branch-and-price time limit in seconds.",
     )
     parser.add_argument(
         "--mip-gap",
         type=float,
         default=None,
-        help="Optional relative MIP gap target for the final master MIP.",
+        help="Optional relative optimality gap target for branch-and-price.",
     )
     parser.add_argument(
         "--max-cg-iterations",
         type=int,
-        default=50,
-        help="Maximum number of column-generation iterations.",
+        default=200,
+        help="Maximum column-generation iterations allowed at each tree node.",
     )
     parser.add_argument(
         "--pricing-time-limit",
         type=float,
         default=None,
-        help="Optional time limit in seconds for each pricing MIP.",
+        help=(
+            "Optional per-pricing time limit in seconds. "
+            "If a pricing MIP hits this limit, the exact solve aborts."
+        ),
+    )
+    parser.add_argument(
+        "--max-bp-nodes",
+        type=int,
+        default=None,
+        help="Optional cap on processed branch-and-price nodes.",
     )
     return parser.parse_args()
 
@@ -996,6 +1611,7 @@ def main() -> None:
         mip_gap=args.mip_gap,
         max_cg_iterations=args.max_cg_iterations,
         pricing_time_limit=args.pricing_time_limit,
+        max_bp_nodes=args.max_bp_nodes,
     )
 
 
