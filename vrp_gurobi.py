@@ -169,19 +169,119 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     node_pairs = [(i, j) for i in node_ids for j in node_ids if i != j]
     arc_keys = [(v, i, j) for v in vehicle_ids for i, j in node_pairs]
 
+    start_limit = {
+        v: max(instance.vehicles[v].available_from_min, instance.depot_open_min)
+        for v in vehicle_ids
+    }
+    end_limit = {
+        v: min(instance.vehicles[v].available_until_min, instance.depot_close_min)
+        for v in vehicle_ids
+    }
+    route_horizon = {v: max(end_limit[v] - start_limit[v], 0.0) for v in vehicle_ids}
+
+    vehicle_stop_lb: dict[tuple[int, int], float] = {}
+    vehicle_stop_ub: dict[tuple[int, int], float] = {}
+    feasible_vehicle_stop: dict[tuple[int, int], bool] = {}
+    min_round_trip: dict[int, float] = {}
+
+    for v in vehicle_ids:
+        feasible_round_trips: list[float] = []
+        for s in stop_ids:
+            stop = instance.stops[s]
+            vehicle = instance.vehicles[v]
+            lb = start_limit[v] + instance.travel_minutes[DEPOT_NODE, s]
+            ub = end_limit[v] - stop.service_min - instance.travel_minutes[s, DEPOT_NODE]
+            feasible = stop.demand_kg <= vehicle.capacity_kg and lb <= ub
+            vehicle_stop_lb[v, s] = lb
+            vehicle_stop_ub[v, s] = ub
+            feasible_vehicle_stop[v, s] = feasible
+            if feasible:
+                feasible_round_trips.append(
+                    instance.travel_minutes[DEPOT_NODE, s]
+                    + stop.service_min
+                    + instance.travel_minutes[s, DEPOT_NODE]
+                )
+        min_round_trip[v] = min(feasible_round_trips) if feasible_round_trips else 0.0
+
+    service_start_lb: dict[int, float] = {}
+    service_start_ub: dict[int, float] = {}
+    early_ub: dict[int, float] = {}
+    late_ub: dict[int, float] = {}
+    early_flag_link_ub: dict[int, float] = {}
+
+    for s in stop_ids:
+        feasible_vehicles = [v for v in vehicle_ids if feasible_vehicle_stop[v, s]]
+        if not feasible_vehicles:
+            raise ValueError(f"Stop {s} cannot be served by any vehicle under the workbook data.")
+        service_start_lb[s] = min(vehicle_stop_lb[v, s] for v in feasible_vehicles)
+        service_start_ub[s] = max(vehicle_stop_ub[v, s] for v in feasible_vehicles)
+        early_ub[s] = max(instance.stops[s].earliest_min - service_start_lb[s], 0.0)
+        late_ub[s] = max(service_start_ub[s] - instance.stops[s].latest_min, 0.0)
+        early_flag_link_ub[s] = early_ub[s]
+
+    feasible_arc: dict[tuple[int, int, int], bool] = {}
+    start_arc_m: dict[tuple[int, int], float] = {}
+    end_arc_m: dict[tuple[int, int], float] = {}
+    stop_arc_m: dict[tuple[int, int, int], float] = {}
+
+    for v in vehicle_ids:
+        for s in stop_ids:
+            stop = instance.stops[s]
+            can_serve = feasible_vehicle_stop[v, s]
+            feasible_arc[v, DEPOT_NODE, s] = can_serve
+            feasible_arc[v, s, DEPOT_NODE] = can_serve
+            start_arc_m[v, s] = max(
+                end_limit[v] - service_start_lb[s] + instance.travel_minutes[DEPOT_NODE, s],
+                0.0,
+            )
+            end_arc_m[v, s] = max(
+                stop.service_min + instance.travel_minutes[s, DEPOT_NODE] + service_start_ub[s],
+                0.0,
+            )
+            for j in stop_ids:
+                if s == j:
+                    continue
+                if not can_serve or not feasible_vehicle_stop[v, j]:
+                    feasible_arc[v, s, j] = False
+                    continue
+                feasible_arc[v, s, j] = (
+                    vehicle_stop_lb[v, s]
+                    + stop.service_min
+                    + instance.travel_minutes[s, j]
+                    <= vehicle_stop_ub[v, j]
+                )
+                stop_arc_m[v, s, j] = max(
+                    stop.service_min
+                    + instance.travel_minutes[s, j]
+                    + service_start_ub[s]
+                    - service_start_lb[j],
+                    0.0,
+                )
+
     x = model.addVars(arc_keys, vtype=GRB.BINARY, name="x")
     use_vehicle = model.addVars(vehicle_ids, vtype=GRB.BINARY, name="use_vehicle")
     depart_min = model.addVars(vehicle_ids, lb=0.0, ub=instance.big_m, name="depart_min")
     return_min = model.addVars(vehicle_ids, lb=0.0, ub=instance.big_m, name="return_min")
     service_start_min = model.addVars(
-        stop_ids, lb=0.0, ub=instance.big_m, name="service_start_min"
+        stop_ids, lb=service_start_lb, ub=service_start_ub, name="service_start_min"
     )
-    early_min = model.addVars(stop_ids, lb=0.0, name="early_min")
-    late_min = model.addVars(stop_ids, lb=0.0, name="late_min")
+    early_min = model.addVars(stop_ids, lb=0.0, ub=early_ub, name="early_min")
+    late_min = model.addVars(stop_ids, lb=0.0, ub=late_ub, name="late_min")
     early_flag = model.addVars(stop_ids, vtype=GRB.BINARY, name="early_flag")
-    idle_min = model.addVars(vehicle_ids, lb=0.0, name="idle_min")
-    regular_min = model.addVars(vehicle_ids, lb=0.0, name="regular_min")
-    overtime_min = model.addVars(vehicle_ids, lb=0.0, name="overtime_min")
+    idle_min = model.addVars(vehicle_ids, lb=0.0, ub=route_horizon, name="idle_min")
+    regular_min = model.addVars(
+        vehicle_ids,
+        lb=0.0,
+        ub={v: 60.0 * instance.cost_params["Regular_Hours_Before_Overtime"] for v in vehicle_ids},
+        name="regular_min",
+    )
+    overtime_min = model.addVars(vehicle_ids, lb=0.0, ub=route_horizon, name="overtime_min")
+
+    fixed_arc_count = 0
+    for v, i, j in arc_keys:
+        if not feasible_arc.get((v, i, j), False):
+            x[v, i, j].ub = 0.0
+            fixed_arc_count += 1
 
     incoming = {
         (v, s): gp.quicksum(x[v, i, s] for i in node_ids if i != s)
@@ -235,7 +335,7 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             name=f"latest_cover[{s}]",
         )
         model.addConstr(
-            early_min[s] <= instance.big_m * early_flag[s],
+            early_min[s] <= early_flag_link_ub[s] * early_flag[s],
             name=f"early_flag_upper[{s}]",
         )
         model.addConstr(
@@ -245,38 +345,47 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
 
     for v in vehicle_ids:
         vehicle = instance.vehicles[v]
-        start_limit = max(vehicle.available_from_min, instance.depot_open_min)
-        end_limit = min(vehicle.available_until_min, instance.depot_close_min)
 
         model.addConstr(starts[v] == use_vehicle[v], name=f"use_vehicle_start[{v}]")
         model.addConstr(returns[v] == use_vehicle[v], name=f"use_vehicle_return[{v}]")
+        model.addConstr(
+            active_min_expr[v] >= min_round_trip[v] * use_vehicle[v],
+            name=f"minimum_route_time[{v}]",
+        )
+
+        for i, j in node_pairs:
+            model.addConstr(x[v, i, j] <= use_vehicle[v], name=f"arc_use_link[{v},{i},{j}]")
 
         for s in stop_ids:
             model.addConstr(
                 incoming[v, s] == outgoing[v, s],
                 name=f"flow[{v},{s}]",
             )
+            model.addConstr(
+                incoming[v, s] <= use_vehicle[v],
+                name=f"visit_use_link[{v},{s}]",
+            )
 
         model.addConstr(
             gp.quicksum(instance.stops[s].demand_kg * incoming[v, s] for s in stop_ids)
-            <= vehicle.capacity_kg,
+            <= vehicle.capacity_kg * use_vehicle[v],
             name=f"capacity[{v}]",
         )
 
         model.addConstr(
-            depart_min[v] >= start_limit * use_vehicle[v],
+            depart_min[v] >= start_limit[v] * use_vehicle[v],
             name=f"depart_lb[{v}]",
         )
         model.addConstr(
-            depart_min[v] <= end_limit * use_vehicle[v],
+            depart_min[v] <= end_limit[v] * use_vehicle[v],
             name=f"depart_ub[{v}]",
         )
         model.addConstr(
-            return_min[v] >= start_limit * use_vehicle[v],
+            return_min[v] >= start_limit[v] * use_vehicle[v],
             name=f"return_lb[{v}]",
         )
         model.addConstr(
-            return_min[v] <= end_limit * use_vehicle[v],
+            return_min[v] <= end_limit[v] * use_vehicle[v],
             name=f"return_ub[{v}]",
         )
         model.addConstr(
@@ -285,43 +394,40 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         )
 
         model.addConstr(
-            idle_min[v] >= active_min_expr[v] - drive_min_expr[v] - service_min_expr[v],
+            idle_min[v] == active_min_expr[v] - drive_min_expr[v] - service_min_expr[v],
             name=f"idle_linearization[{v}]",
         )
         model.addConstr(
             regular_min[v] + overtime_min[v] == active_min_expr[v],
             name=f"labor_partition[{v}]",
         )
-        model.addConstr(
-            regular_min[v]
-            <= 60.0 * instance.cost_params["Regular_Hours_Before_Overtime"],
-            name=f"regular_hour_cap[{v}]",
-        )
 
         for s in stop_ids:
-            model.addConstr(
-                service_start_min[s] - depart_min[v]
-                >= instance.travel_minutes[DEPOT_NODE, s]
-                - instance.big_m * (1 - x[v, DEPOT_NODE, s]),
-                name=f"time_from_depot[{v},{s}]",
-            )
-            model.addConstr(
-                return_min[v] - service_start_min[s]
-                >= instance.stops[s].service_min
-                + instance.travel_minutes[s, DEPOT_NODE]
-                - instance.big_m * (1 - x[v, s, DEPOT_NODE]),
-                name=f"time_to_depot[{v},{s}]",
-            )
+            if feasible_arc[v, DEPOT_NODE, s]:
+                model.addConstr(
+                    service_start_min[s] - depart_min[v]
+                    >= instance.travel_minutes[DEPOT_NODE, s]
+                    - start_arc_m[v, s] * (1 - x[v, DEPOT_NODE, s]),
+                    name=f"time_from_depot[{v},{s}]",
+                )
+            if feasible_arc[v, s, DEPOT_NODE]:
+                model.addConstr(
+                    return_min[v] - service_start_min[s]
+                    >= instance.stops[s].service_min
+                    + instance.travel_minutes[s, DEPOT_NODE]
+                    - end_arc_m[v, s] * (1 - x[v, s, DEPOT_NODE]),
+                    name=f"time_to_depot[{v},{s}]",
+                )
 
         for i in stop_ids:
             for j in stop_ids:
-                if i == j:
+                if i == j or not feasible_arc[v, i, j]:
                     continue
                 model.addConstr(
                     service_start_min[j] - service_start_min[i]
                     >= instance.stops[i].service_min
                     + instance.travel_minutes[i, j]
-                    - instance.big_m * (1 - x[v, i, j]),
+                    - stop_arc_m[v, i, j] * (1 - x[v, i, j]),
                     name=f"time_between_stops[{v},{i},{j}]",
                 )
 
@@ -358,6 +464,7 @@ def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         "service_min_expr": service_min_expr,
         "active_min_expr": active_min_expr,
         "distance_cost_expr": distance_cost_expr,
+        "fixed_arc_count": fixed_arc_count,
         "node_ids": node_ids,
         "stop_ids": stop_ids,
         "vehicle_ids": vehicle_ids,
