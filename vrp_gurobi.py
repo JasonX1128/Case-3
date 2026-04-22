@@ -3,22 +3,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, time
-from pprint import pprint
+from pathlib import Path
 from typing import Any
 
 import gurobipy as gp
 from gurobipy import GRB
-
-from vrp_instance_data import (
-    BIG_M,
-    COST_PARAMETERS,
-    DEPOT_CLOSE,
-    DEPOT_OPEN,
-    DISTANCE_MATRIX,
-    STOPS,
-    TRAVEL_TIME_MATRIX,
-    VEHICLES,
-)
+from openpyxl import load_workbook
 
 
 DEPOT_NODE = 0
@@ -90,79 +80,84 @@ def minutes_to_clock(minutes: float) -> str:
     return f"{hours:02d}:{mins:02d}"
 
 
-def load_instance() -> Instance:
+def load_instance(workbook_path: Path) -> Instance:
+    wb = load_workbook(workbook_path, data_only=True)
+
+    ws_stops = wb["Delivery Stops"]
+    ws_vehicles = wb["Vehicle Fleet"]
+    ws_depot = wb["Depot"]
+    ws_dist = wb["Distance Matrix (miles)"]
+    ws_time = wb["Travel Time Matrix (min)"]
+    ws_cost = wb["Cost Parameters"]
+    ws_solver = wb["Solver Setup"]
+
+    big_m = float(ws_solver["B9"].value)
+
     stops: dict[int, StopData] = {}
-    for row in STOPS:
-        stop_id = int(row["stop_id"])
+    for row in range(2, ws_stops.max_row + 1):
+        stop_id = int(ws_stops[f"A{row}"].value)
         stops[stop_id] = StopData(
             stop_id=stop_id,
-            customer_name=str(row["customer_name"]),
-            demand_kg=float(row["demand_kg"]),
-            earliest_min=excel_time_to_minutes(row["earliest"]),
-            latest_min=excel_time_to_minutes(row["latest"]),
-            service_min=float(row["service_min"]),
+            customer_name=str(ws_stops[f"B{row}"].value),
+            demand_kg=float(ws_stops[f"D{row}"].value),
+            earliest_min=excel_time_to_minutes(ws_stops[f"E{row}"].value),
+            latest_min=excel_time_to_minutes(ws_stops[f"F{row}"].value),
+            service_min=float(ws_stops[f"G{row}"].value),
         )
 
     vehicles: dict[int, VehicleData] = {}
-    for row in VEHICLES:
-        vehicle_id = int(row["vehicle_id"])
+    for row in range(2, ws_vehicles.max_row + 1):
+        vehicle_id = int(ws_vehicles[f"A{row}"].value)
         vehicles[vehicle_id] = VehicleData(
             vehicle_id=vehicle_id,
-            vehicle_type=str(row["vehicle_type"]),
-            capacity_kg=float(row["capacity_kg"]),
-            cost_per_mile=float(row["cost_per_mile"]),
-            fixed_daily_cost=float(row["fixed_daily_cost"]),
-            available_from_min=excel_time_to_minutes(row["available_from"]),
-            available_until_min=excel_time_to_minutes(row["available_until"]),
+            vehicle_type=str(ws_vehicles[f"B{row}"].value),
+            capacity_kg=float(ws_vehicles[f"C{row}"].value),
+            cost_per_mile=float(ws_vehicles[f"D{row}"].value),
+            fixed_daily_cost=float(ws_vehicles[f"E{row}"].value),
+            available_from_min=excel_time_to_minutes(ws_vehicles[f"F{row}"].value),
+            available_until_min=excel_time_to_minutes(ws_vehicles[f"G{row}"].value),
         )
 
-    depot_open_min = excel_time_to_minutes(DEPOT_OPEN)
-    depot_close_min = excel_time_to_minutes(DEPOT_CLOSE)
+    depot_open_min = excel_time_to_minutes(ws_depot["C2"].value)
+    depot_close_min = excel_time_to_minutes(ws_depot["D2"].value)
 
     node_ids = [DEPOT_NODE] + sorted(stops)
     expected_size = len(node_ids)
-    if len(DISTANCE_MATRIX) != expected_size or any(len(row) != expected_size for row in DISTANCE_MATRIX):
+    if ws_dist.max_row != expected_size + 1 or ws_dist.max_column != expected_size + 1:
         raise ValueError(
-            "Distance matrix dimensions do not match the number of nodes in the Python data."
+            "Distance matrix dimensions do not match the number of nodes in the workbook."
         )
-    if len(TRAVEL_TIME_MATRIX) != expected_size or any(
-        len(row) != expected_size for row in TRAVEL_TIME_MATRIX
-    ):
+    if ws_time.max_row != expected_size + 1 or ws_time.max_column != expected_size + 1:
         raise ValueError(
-            "Travel-time matrix dimensions do not match the number of nodes in the Python data."
+            "Travel-time matrix dimensions do not match the number of nodes in the workbook."
         )
 
     distance_miles: dict[tuple[int, int], float] = {}
     travel_minutes: dict[tuple[int, int], float] = {}
-    for row_idx, from_node in enumerate(node_ids):
-        for col_idx, to_node in enumerate(node_ids):
-            distance_miles[from_node, to_node] = float(DISTANCE_MATRIX[row_idx][col_idx])
-            travel_minutes[from_node, to_node] = float(TRAVEL_TIME_MATRIX[row_idx][col_idx])
+    for row_offset, from_node in enumerate(node_ids, start=2):
+        for col_offset, to_node in enumerate(node_ids, start=2):
+            distance_miles[from_node, to_node] = float(ws_dist.cell(row_offset, col_offset).value)
+            travel_minutes[from_node, to_node] = float(ws_time.cell(row_offset, col_offset).value)
+
+    cost_params: dict[str, float] = {}
+    for row in range(2, ws_cost.max_row + 1):
+        key = str(ws_cost[f"A{row}"].value)
+        cost_params[key] = float(ws_cost[f"B{row}"].value)
 
     return Instance(
         stops=stops,
         vehicles=vehicles,
         distance_miles=distance_miles,
         travel_minutes=travel_minutes,
-        cost_params={key: float(value) for key, value in COST_PARAMETERS.items()},
+        cost_params=cost_params,
         depot_open_min=depot_open_min,
         depot_close_min=depot_close_min,
-        big_m=float(BIG_M),
+        big_m=big_m,
     )
 
 
-def create_model() -> tuple[gp.Model, dict[str, Any]]:
-    return build_model(load_instance())
-
-
-def show_data() -> None:
-    print("Stops:")
-    pprint(STOPS, width=140)
-    print("\nVehicles:")
-    pprint(VEHICLES, width=140)
-    print("\nCost Parameters:")
-    pprint(COST_PARAMETERS, width=140)
-    print(f"\nDepot: open={DEPOT_OPEN}, close={DEPOT_CLOSE}, big_m={BIG_M}")
+def create_model(workbook_path: Path) -> tuple[gp.Model, dict[str, Any]]:
+    return build_model(load_instance(workbook_path))
 
 
 def build_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
@@ -398,8 +393,12 @@ def extract_route(data: dict[str, Any], vehicle_id: int) -> list[int]:
     return route
 
 
-def solve_model(time_limit: float | None, mip_gap: float | None) -> None:
-    instance = load_instance()
+def solve_model(
+    workbook_path: Path,
+    time_limit: float | None,
+    mip_gap: float | None,
+) -> None:
+    instance = load_instance(workbook_path)
     model, data = build_model(instance)
 
     if time_limit is not None:
@@ -481,12 +480,13 @@ def solve_model(time_limit: float | None, mip_gap: float | None) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Solve the standalone Python VRP model."
+        description="Translate the Excel VRP formulation in Team_02_Data.xlsx into a Gurobi model."
     )
     parser.add_argument(
-        "--show-data",
-        action="store_true",
-        help="Print the Python data structures that define the instance and exit.",
+        "--workbook",
+        type=Path,
+        required=True,
+        help="Path to the Excel workbook.",
     )
     parser.add_argument(
         "--time-limit",
@@ -505,10 +505,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.show_data:
-        show_data()
-        return
-    solve_model(args.time_limit, args.mip_gap)
+    solve_model(args.workbook, args.time_limit, args.mip_gap)
 
 
 if __name__ == "__main__":
