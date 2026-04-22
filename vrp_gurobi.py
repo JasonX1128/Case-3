@@ -149,6 +149,7 @@ class PricingLabel:
     load_kg: float
     time_after_service: float
     reduced_cost: float
+    nonlabor_reduced_cost: float
     predecessor_idx: int | None
 
 
@@ -981,10 +982,78 @@ def solve_pricing_subproblem(
             if earliest_finish_j + instance.travel_minutes[j, DEPOT_NODE] <= end_limit + 1e-9:
                 potential_successors[i].append(j)
 
+    positive_cover_duals = {
+        stop_id: max(cover_duals[stop_id], 0.0) for stop_id in stop_ids
+    }
+    positive_dual_stops = [
+        stop_id for stop_id in stop_ids if positive_cover_duals[stop_id] > REDUCED_COST_TOL
+    ]
+    group_mask_list = sorted(together_group_masks)
+    stop_bit_pairs = [(stop_id, stop_mask[stop_id]) for stop_id in stop_ids]
+    mask_resource_cache: dict[int, tuple[float, float]] = {}
+    partial_group_requirement_cache: dict[int, int] = {}
+    forced_chain_cache: dict[int, tuple[int, float] | None] = {}
+    mandatory_remainder_cache: dict[tuple[int, int], tuple[int, float, float] | None] = {}
+    optimistic_reward_cache: dict[tuple[int, int], float] = {}
+
+    def mask_resources(mask: int) -> tuple[float, float]:
+        cached = mask_resource_cache.get(mask)
+        if cached is not None:
+            return cached
+        demand = 0.0
+        service = 0.0
+        for stop_id, stop_bit in stop_bit_pairs:
+            if mask & stop_bit:
+                stop = instance.stops[stop_id]
+                demand += stop.demand_kg
+                service += stop.service_min
+        mask_resource_cache[mask] = (demand, service)
+        return mask_resource_cache[mask]
+
+    def partial_group_requirement_mask(visited_mask: int) -> int:
+        cached = partial_group_requirement_cache.get(visited_mask)
+        if cached is not None:
+            return cached
+        requirement_mask = 0
+        for group_mask in group_mask_list:
+            visited_group_mask = visited_mask & group_mask
+            if visited_group_mask not in {0, group_mask}:
+                requirement_mask |= group_mask & ~visited_mask
+        partial_group_requirement_cache[visited_mask] = requirement_mask
+        return requirement_mask
+
+    def forced_chain_requirement(node: int) -> tuple[int, float] | None:
+        if node in forced_chain_cache:
+            return forced_chain_cache[node]
+        if node == DEPOT_NODE:
+            forced_chain_cache[node] = (0, 0.0)
+            return forced_chain_cache[node]
+
+        requirement_mask = 0
+        minimum_extra_time = 0.0
+        current = node
+        seen: set[int] = set()
+        while current in branch_ctx.forced_successor:
+            next_node = branch_ctx.forced_successor[current]
+            minimum_extra_time += instance.travel_minutes[current, next_node]
+            if next_node == DEPOT_NODE:
+                forced_chain_cache[node] = (requirement_mask, minimum_extra_time)
+                return forced_chain_cache[node]
+            if next_node in seen or not feasible_stop.get(next_node, False):
+                forced_chain_cache[node] = None
+                return None
+            seen.add(next_node)
+            requirement_mask |= stop_mask[next_node]
+            minimum_extra_time += instance.stops[next_node].service_min
+            current = next_node
+
+        forced_chain_cache[node] = (requirement_mask, minimum_extra_time)
+        return forced_chain_cache[node]
+
     label_store: list[PricingLabel] = []
     label_alive: list[bool] = []
     labels_at_node: dict[int, list[int]] = defaultdict(list)
-    frontier: list[tuple[float, int]] = []
+    frontier: list[tuple[float, float, int]] = []
     explored_labels = 0
 
     def dominates(lhs: PricingLabel, rhs: PricingLabel) -> bool:
@@ -992,9 +1061,96 @@ def solve_pricing_subproblem(
             lhs.node == rhs.node
             and lhs.time_after_service <= rhs.time_after_service + 1e-9
             and lhs.load_kg <= rhs.load_kg + 1e-9
-            and lhs.reduced_cost <= rhs.reduced_cost + 1e-9
+            and lhs.nonlabor_reduced_cost <= rhs.nonlabor_reduced_cost + 1e-9
             and (lhs.visited_mask & ~rhs.visited_mask) == 0
         )
+
+    def mandatory_remainder_info(label: PricingLabel) -> tuple[int, float, float] | None:
+        cache_key = (label.node, label.visited_mask)
+        if cache_key in mandatory_remainder_cache:
+            return mandatory_remainder_cache[cache_key]
+
+        chain_requirement = forced_chain_requirement(label.node)
+        if chain_requirement is None:
+            mandatory_remainder_cache[cache_key] = None
+            return None
+        chain_mask, chain_time_lb = chain_requirement
+        if chain_mask & label.visited_mask:
+            mandatory_remainder_cache[cache_key] = None
+            return None
+
+        group_mask = partial_group_requirement_mask(label.visited_mask)
+        if group_mask & ~chain_mask:
+            chain_terminal_node = label.node
+            while chain_terminal_node in branch_ctx.forced_successor:
+                next_node = branch_ctx.forced_successor[chain_terminal_node]
+                if next_node == DEPOT_NODE:
+                    mandatory_remainder_cache[cache_key] = None
+                    return None
+                chain_terminal_node = next_node
+
+        requirement_mask = chain_mask | group_mask
+        if requirement_mask & label.visited_mask:
+            mandatory_remainder_cache[cache_key] = None
+            return None
+
+        for stop_id, stop_bit in stop_bit_pairs:
+            if not (requirement_mask & stop_bit):
+                continue
+            if separated_mask_by_stop[stop_id] & (label.visited_mask | (requirement_mask ^ stop_bit)):
+                mandatory_remainder_cache[cache_key] = None
+                return None
+
+        requirement_demand, requirement_service = mask_resources(requirement_mask)
+        chain_demand, chain_service = mask_resources(chain_mask)
+        mandatory_remainder_cache[cache_key] = (
+            requirement_mask,
+            requirement_demand,
+            (requirement_service - chain_service) + chain_time_lb,
+        )
+        return mandatory_remainder_cache[cache_key]
+
+    def optimistic_remaining_reward(label: PricingLabel) -> float:
+        cache_key = (label.node, label.visited_mask)
+        if cache_key in optimistic_reward_cache:
+            return optimistic_reward_cache[cache_key]
+
+        if label.node in last_forced_stops:
+            optimistic_reward_cache[cache_key] = 0.0
+            return 0.0
+
+        reward = 0.0
+        for stop_id in positive_dual_stops:
+            stop_bit = stop_mask[stop_id]
+            if label.visited_mask & stop_bit:
+                continue
+            if separated_mask_by_stop[stop_id] & label.visited_mask:
+                continue
+            forced_pred = branch_ctx.forced_predecessor.get(stop_id)
+            if (
+                forced_pred is not None
+                and forced_pred != label.node
+                and forced_pred in stop_mask
+                and label.visited_mask & stop_mask[forced_pred]
+            ):
+                continue
+            reward += positive_cover_duals[stop_id]
+
+        optimistic_reward_cache[cache_key] = reward
+        return reward
+
+    def optimistic_completion_lower_bound(label: PricingLabel) -> float:
+        mandatory_info = mandatory_remainder_info(label)
+        if mandatory_info is None:
+            return float("inf")
+        _, requirement_demand, requirement_time_lb = mandatory_info
+        if label.load_kg + requirement_demand > vehicle_type.capacity_kg + 1e-9:
+            return float("inf")
+        if label.time_after_service + requirement_time_lb > end_limit + 1e-9:
+            return float("inf")
+        if not can_return_from(label) and not candidate_successors(label):
+            return float("inf")
+        return label.reduced_cost - optimistic_remaining_reward(label)
 
     def can_return_from(label: PricingLabel) -> bool:
         if label.node in branch_ctx.forced_successor:
@@ -1044,6 +1200,10 @@ def solve_pricing_subproblem(
         return route_reduced_cost(route, cover_duals=cover_duals, type_dual=type_dual)
 
     def add_label(label: PricingLabel) -> int | None:
+        optimistic_lb = optimistic_completion_lower_bound(label)
+        if optimistic_lb >= -REDUCED_COST_TOL:
+            return None
+
         node_labels = labels_at_node[label.node]
         surviving: list[int] = []
         for idx in node_labels:
@@ -1060,7 +1220,7 @@ def solve_pricing_subproblem(
         label_alive.append(True)
         surviving.append(label_idx)
         labels_at_node[label.node] = surviving
-        heapq.heappush(frontier, (label.reduced_cost, label_idx))
+        heapq.heappush(frontier, (optimistic_lb, label.reduced_cost, label_idx))
         return label_idx
 
     def candidate_successors(label: PricingLabel) -> list[int]:
@@ -1142,6 +1302,7 @@ def solve_pricing_subproblem(
                 load_kg=stop.demand_kg,
                 time_after_service=time_after_service,
                 reduced_cost=reduced_cost,
+                nonlabor_reduced_cost=reduced_cost - operating_labor_cost(instance, elapsed),
                 predecessor_idx=None,
             )
         )
@@ -1149,7 +1310,7 @@ def solve_pricing_subproblem(
             return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
 
     while frontier:
-        _, label_idx = heapq.heappop(frontier)
+        _, _, label_idx = heapq.heappop(frontier)
         if not label_alive[label_idx]:
             continue
 
@@ -1196,6 +1357,14 @@ def solve_pricing_subproblem(
                     load_kg=new_load,
                     time_after_service=time_after_service,
                     reduced_cost=new_reduced_cost,
+                    nonlabor_reduced_cost=(
+                        label.nonlabor_reduced_cost
+                        + instance.distance_miles[label.node, next_stop] * distance_unit_cost
+                        + max(arrival - next_stop_data.latest_min, 0.0)
+                        / 60.0
+                        * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+                        - cover_duals[next_stop]
+                    ),
                     predecessor_idx=label_idx,
                 )
             )
