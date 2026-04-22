@@ -91,6 +91,8 @@ class BranchState:
     forced_arcs: frozenset[tuple[int, int]]
     excluded_assignments: frozenset[tuple[int, str]]
     forced_assignments: frozenset[tuple[int, str]]
+    same_route_pairs: frozenset[tuple[int, int]]
+    different_route_pairs: frozenset[tuple[int, int]]
 
 
 @dataclass
@@ -101,6 +103,11 @@ class BranchContext:
     forced_predecessor: dict[int, int]
     forced_type_for_stop: dict[int, str]
     excluded_types_by_stop: dict[int, set[str]]
+    together_groups: tuple[frozenset[int], ...]
+    together_group_by_stop: dict[int, frozenset[int]]
+    together_stop_pairs: frozenset[tuple[int, int]]
+    separated_stop_pairs: frozenset[tuple[int, int]]
+    separated_stops_by_stop: dict[int, set[int]]
 
 
 @dataclass
@@ -768,6 +775,60 @@ def build_branch_context(
         if stop_id not in forced_type_for_stop and excluded_types_by_stop.get(stop_id) == all_type_ids:
             return None
 
+    stop_ids = sorted(instance.stops)
+    parent = {stop_id: stop_id for stop_id in stop_ids}
+
+    def find(stop_id: int) -> int:
+        while parent[stop_id] != stop_id:
+            parent[stop_id] = parent[parent[stop_id]]
+            stop_id = parent[stop_id]
+        return stop_id
+
+    def union(stop_a: int, stop_b: int) -> None:
+        root_a = find(stop_a)
+        root_b = find(stop_b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for stop_a, stop_b in branch_state.same_route_pairs:
+        if stop_a not in instance.stops or stop_b not in instance.stops or stop_a == stop_b:
+            return None
+        union(stop_a, stop_b)
+
+    group_members: dict[int, set[int]] = defaultdict(set)
+    for stop_id in stop_ids:
+        group_members[find(stop_id)].add(stop_id)
+
+    together_groups = tuple(
+        sorted((frozenset(group) for group in group_members.values() if len(group) > 1), key=min)
+    )
+    together_group_by_stop = {
+        stop_id: group for group in together_groups for stop_id in group
+    }
+
+    together_stop_pairs: set[tuple[int, int]] = set()
+    for group in together_groups:
+        ordered_group = sorted(group)
+        for idx, stop_a in enumerate(ordered_group):
+            for stop_b in ordered_group[idx + 1 :]:
+                together_stop_pairs.add((stop_a, stop_b))
+
+    separated_stop_pairs: set[tuple[int, int]] = set()
+    separated_stops_by_stop: dict[int, set[int]] = defaultdict(set)
+    for stop_a, stop_b in branch_state.different_route_pairs:
+        if stop_a not in instance.stops or stop_b not in instance.stops or stop_a == stop_b:
+            return None
+        root_a = find(stop_a)
+        root_b = find(stop_b)
+        if root_a == root_b:
+            return None
+        for group_stop_a in group_members[root_a]:
+            for group_stop_b in group_members[root_b]:
+                pair = tuple(sorted((group_stop_a, group_stop_b)))
+                separated_stop_pairs.add(pair)
+                separated_stops_by_stop[group_stop_a].add(group_stop_b)
+                separated_stops_by_stop[group_stop_b].add(group_stop_a)
+
     return BranchContext(
         forbidden_arcs=branch_state.forbidden_arcs,
         forced_arcs=tuple(sorted(branch_state.forced_arcs)),
@@ -775,12 +836,25 @@ def build_branch_context(
         forced_predecessor=forced_predecessor,
         forced_type_for_stop=forced_type_for_stop,
         excluded_types_by_stop=excluded_types_by_stop,
+        together_groups=together_groups,
+        together_group_by_stop=together_group_by_stop,
+        together_stop_pairs=frozenset(together_stop_pairs),
+        separated_stop_pairs=frozenset(separated_stop_pairs),
+        separated_stops_by_stop=separated_stops_by_stop,
     )
 
 
 def route_is_compatible(route: RouteColumn, branch_ctx: BranchContext) -> bool:
     if route.arc_set & branch_ctx.forbidden_arcs:
         return False
+
+    for group in branch_ctx.together_groups:
+        if route.stop_set & group and not group.issubset(route.stop_set):
+            return False
+
+    for stop_id in route.stop_set:
+        if branch_ctx.separated_stops_by_stop.get(stop_id, set()) & route.stop_set:
+            return False
 
     for stop_id, forced_type in branch_ctx.forced_type_for_stop.items():
         if stop_id in route.stop_set and route.type_id != forced_type:
@@ -845,6 +919,18 @@ def solve_pricing_subproblem(
 
     stop_to_pos = {stop_id: idx for idx, stop_id in enumerate(stop_ids)}
     stop_mask = {stop_id: 1 << stop_to_pos[stop_id] for stop_id in stop_ids}
+    together_group_masks = {
+        sum(stop_mask[group_stop] for group_stop in group if group_stop in stop_mask)
+        for group in branch_ctx.together_groups
+    }
+    separated_mask_by_stop = {
+        stop_id: sum(
+            stop_mask[other_stop]
+            for other_stop in branch_ctx.separated_stops_by_stop.get(stop_id, set())
+            if other_stop in stop_mask
+        )
+        for stop_id in stop_ids
+    }
 
     feasible_stop: dict[int, bool] = {}
     potential_successors: dict[int, list[int]] = {DEPOT_NODE: []}
@@ -915,6 +1001,10 @@ def solve_pricing_subproblem(
             return False
         if (label.node, DEPOT_NODE) in branch_ctx.forbidden_arcs:
             return False
+        for group_mask in together_group_masks:
+            visited_group_mask = label.visited_mask & group_mask
+            if visited_group_mask not in {0, group_mask}:
+                return False
         return (
             label.time_after_service + instance.travel_minutes[label.node, DEPOT_NODE]
             <= end_limit + 1e-9
@@ -990,6 +1080,8 @@ def solve_pricing_subproblem(
         candidates: list[int] = []
         for next_stop in potential_successors[label.node]:
             if label.visited_mask & stop_mask[next_stop]:
+                continue
+            if separated_mask_by_stop[next_stop] & label.visited_mask:
                 continue
             forced_pred = branch_ctx.forced_predecessor.get(next_stop)
             if forced_pred is not None and forced_pred != label.node:
@@ -1516,22 +1608,146 @@ def compute_assignment_values(
     return assignment_values
 
 
+def compute_pair_together_values(
+    routes: list[RouteColumn],
+    route_values: list[float],
+) -> dict[tuple[int, int], float]:
+    pair_values: dict[tuple[int, int], float] = defaultdict(float)
+    for route, value in zip(routes, route_values):
+        if value <= INTEGRALITY_TOL or len(route.stop_sequence) < 2:
+            continue
+        ordered_stops = sorted(route.stop_set)
+        for idx, stop_a in enumerate(ordered_stops):
+            for stop_b in ordered_stops[idx + 1 :]:
+                pair_values[stop_a, stop_b] += value
+    return pair_values
+
+
+def route_conflicts_with_forced_arc(route: RouteColumn, arc: tuple[int, int]) -> bool:
+    i, j = arc
+    if arc in route.arc_set:
+        return False
+    if i == DEPOT_NODE:
+        return j in route.stop_set
+    if j == DEPOT_NODE:
+        return i in route.stop_set
+    return i in route.stop_set or j in route.stop_set
+
+
+def route_conflicts_with_forced_assignment(
+    route: RouteColumn,
+    stop_id: int,
+    type_id: str,
+) -> bool:
+    return stop_id in route.stop_set and route.type_id != type_id
+
+
+def route_conflicts_with_excluded_assignment(
+    route: RouteColumn,
+    stop_id: int,
+    type_id: str,
+) -> bool:
+    return stop_id in route.stop_set and route.type_id == type_id
+
+
+def select_ryan_foster_pair(
+    instance: Instance,
+    routes: list[RouteColumn],
+    route_values: list[float],
+    branch_ctx: BranchContext,
+) -> tuple[int, int] | None:
+    pair_values = compute_pair_together_values(routes, route_values)
+    fixed_pairs = set(branch_ctx.together_stop_pairs) | set(branch_ctx.separated_stop_pairs)
+    best_pair: tuple[int, int] | None = None
+    best_score: tuple[float, float, int, int, float] | None = None
+
+    stop_ids = sorted(instance.stops)
+    for idx, stop_a in enumerate(stop_ids):
+        for stop_b in stop_ids[idx + 1 :]:
+            pair = (stop_a, stop_b)
+            if pair in fixed_pairs:
+                continue
+            together_value = pair_values.get(pair, 0.0)
+            if not (INTEGRALITY_TOL < together_value < 1.0 - INTEGRALITY_TOL):
+                continue
+
+            together_mass = 0.0
+            separate_mass = 0.0
+            together_columns = 0
+            separate_columns = 0
+            for route, route_value in zip(routes, route_values):
+                if route_value <= INTEGRALITY_TOL:
+                    continue
+                has_a = stop_a in route.stop_set
+                has_b = stop_b in route.stop_set
+                if has_a and has_b:
+                    together_mass += route_value
+                    together_columns += 1
+                elif has_a or has_b:
+                    separate_mass += route_value
+                    separate_columns += 1
+
+            score = (
+                min(together_mass, separate_mass),
+                together_mass + separate_mass,
+                min(together_columns, separate_columns),
+                together_columns + separate_columns,
+                -abs(together_value - 0.5),
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                best_pair = pair
+
+    return best_pair
+
+
 def select_fractional_arc(
     routes: list[RouteColumn],
     route_values: list[float],
     branch_ctx: BranchContext,
 ) -> tuple[int, int] | None:
     fixed_arcs = set(branch_ctx.forced_arcs) | set(branch_ctx.forbidden_arcs)
-    best_arc: tuple[int, int] | None = None
-    best_score: tuple[int, float] | None = None
+    arc_values = compute_arc_values(routes, route_values)
+    fractional_arcs = {
+        arc: value
+        for arc, value in arc_values.items()
+        if arc not in fixed_arcs and INTEGRALITY_TOL < value < 1.0 - INTEGRALITY_TOL
+    }
+    fractional_outgoing_count: dict[int, int] = defaultdict(int)
+    fractional_incoming_count: dict[int, int] = defaultdict(int)
+    for i, j in fractional_arcs:
+        fractional_outgoing_count[i] += 1
+        fractional_incoming_count[j] += 1
 
-    for arc, value in compute_arc_values(routes, route_values).items():
-        if arc in fixed_arcs:
-            continue
-        if not (INTEGRALITY_TOL < value < 1.0 - INTEGRALITY_TOL):
-            continue
-        score = (1 if DEPOT_NODE in arc else 0, abs(value - 0.5))
-        if best_score is None or score < best_score:
+    best_arc: tuple[int, int] | None = None
+    best_score: tuple[float, float, int, int, int, float] | None = None
+
+    for arc, value in fractional_arcs.items():
+        forbid_mass = 0.0
+        force_mass = 0.0
+        forbid_columns = 0
+        force_columns = 0
+        for route, route_value in zip(routes, route_values):
+            if route_value <= INTEGRALITY_TOL:
+                continue
+            if arc in route.arc_set:
+                forbid_mass += route_value
+                forbid_columns += 1
+            if route_conflicts_with_forced_arc(route, arc):
+                force_mass += route_value
+                force_columns += 1
+
+        i, j = arc
+        ambiguity = fractional_outgoing_count[i] + fractional_incoming_count[j]
+        score = (
+            min(forbid_mass, force_mass),
+            forbid_mass + force_mass,
+            min(forbid_columns, force_columns),
+            ambiguity,
+            0 if DEPOT_NODE in arc else 1,
+            -abs(value - 0.5),
+        )
+        if best_score is None or score > best_score:
             best_score = score
             best_arc = arc
 
@@ -1547,7 +1763,7 @@ def select_fractional_assignment(
 ) -> tuple[int, str] | None:
     assignment_values = compute_assignment_values(routes, route_values)
     best_assignment: tuple[int, str] | None = None
-    best_score: float | None = None
+    best_score: tuple[float, float, int, int, float] | None = None
 
     for stop_id in sorted(instance.stops):
         if stop_id in branch_ctx.forced_type_for_stop:
@@ -1558,8 +1774,27 @@ def select_fractional_assignment(
             value = assignment_values.get((stop_id, type_id), 0.0)
             if not (INTEGRALITY_TOL < value < 1.0 - INTEGRALITY_TOL):
                 continue
-            score = abs(value - 0.5)
-            if best_score is None or score < best_score:
+            exclude_mass = 0.0
+            force_mass = 0.0
+            exclude_columns = 0
+            force_columns = 0
+            for route, route_value in zip(routes, route_values):
+                if route_value <= INTEGRALITY_TOL:
+                    continue
+                if route_conflicts_with_excluded_assignment(route, stop_id, type_id):
+                    exclude_mass += route_value
+                    exclude_columns += 1
+                if route_conflicts_with_forced_assignment(route, stop_id, type_id):
+                    force_mass += route_value
+                    force_columns += 1
+            score = (
+                min(exclude_mass, force_mass),
+                exclude_mass + force_mass,
+                min(exclude_columns, force_columns),
+                exclude_columns + force_columns,
+                -abs(value - 0.5),
+            )
+            if best_score is None or score > best_score:
                 best_score = score
                 best_assignment = (stop_id, type_id)
 
@@ -1584,6 +1819,8 @@ def create_model(
         forced_arcs=frozenset(),
         excluded_assignments=frozenset(),
         forced_assignments=frozenset(),
+        same_route_pairs=frozenset(),
+        different_route_pairs=frozenset(),
     )
     root_result = solve_node_relaxation(
         instance=instance,
@@ -1651,6 +1888,8 @@ def branch_and_price(
         forced_arcs=frozenset(),
         excluded_assignments=frozenset(),
         forced_assignments=frozenset(),
+        same_route_pairs=frozenset(),
+        different_route_pairs=frozenset(),
     )
 
     deadline = perf_counter() + time_limit if time_limit is not None else None
@@ -1810,54 +2049,103 @@ def branch_and_price(
             continue
 
         child_states: list[BranchState] = []
-        branch_arc = select_fractional_arc(
+        branch_pair = select_ryan_foster_pair(
+            instance=instance,
             routes=node_result.routes,
             route_values=node_result.route_values,
             branch_ctx=branch_ctx,
         )
-        if branch_arc is not None:
+        if branch_pair is not None:
+            if progress is not None:
+                progress.emit(
+                    f"Branching on Ryan-Foster pair ({branch_pair[0]}, {branch_pair[1]}) "
+                    f"at node depth {depth}"
+                )
             child_states = [
                 BranchState(
-                    forbidden_arcs=frozenset(set(branch_state.forbidden_arcs) | {branch_arc}),
+                    forbidden_arcs=branch_state.forbidden_arcs,
                     forced_arcs=branch_state.forced_arcs,
                     excluded_assignments=branch_state.excluded_assignments,
                     forced_assignments=branch_state.forced_assignments,
+                    same_route_pairs=branch_state.same_route_pairs,
+                    different_route_pairs=frozenset(
+                        set(branch_state.different_route_pairs) | {branch_pair}
+                    ),
                 ),
                 BranchState(
                     forbidden_arcs=branch_state.forbidden_arcs,
-                    forced_arcs=frozenset(set(branch_state.forced_arcs) | {branch_arc}),
+                    forced_arcs=branch_state.forced_arcs,
                     excluded_assignments=branch_state.excluded_assignments,
                     forced_assignments=branch_state.forced_assignments,
+                    same_route_pairs=frozenset(set(branch_state.same_route_pairs) | {branch_pair}),
+                    different_route_pairs=branch_state.different_route_pairs,
                 ),
             ]
         else:
-            branch_assignment = select_fractional_assignment(
-                instance=instance,
-                vehicle_types=vehicle_types,
-                routes=node_result.routes,
-                route_values=node_result.route_values,
-                branch_ctx=branch_ctx,
+            branch_arc = select_fractional_arc(
+            routes=node_result.routes,
+            route_values=node_result.route_values,
+            branch_ctx=branch_ctx,
             )
-            if branch_assignment is not None:
-                stop_id, type_id = branch_assignment
+            if branch_arc is not None:
+                if progress is not None:
+                    progress.emit(
+                        f"Branching on arc {branch_arc[0]} -> {branch_arc[1]} at node depth {depth}"
+                    )
                 child_states = [
                     BranchState(
-                        forbidden_arcs=branch_state.forbidden_arcs,
+                        forbidden_arcs=frozenset(set(branch_state.forbidden_arcs) | {branch_arc}),
                         forced_arcs=branch_state.forced_arcs,
-                        excluded_assignments=frozenset(
-                            set(branch_state.excluded_assignments) | {(stop_id, type_id)}
-                        ),
+                        excluded_assignments=branch_state.excluded_assignments,
                         forced_assignments=branch_state.forced_assignments,
+                        same_route_pairs=branch_state.same_route_pairs,
+                        different_route_pairs=branch_state.different_route_pairs,
                     ),
                     BranchState(
                         forbidden_arcs=branch_state.forbidden_arcs,
-                        forced_arcs=branch_state.forced_arcs,
+                        forced_arcs=frozenset(set(branch_state.forced_arcs) | {branch_arc}),
                         excluded_assignments=branch_state.excluded_assignments,
-                        forced_assignments=frozenset(
-                            set(branch_state.forced_assignments) | {(stop_id, type_id)}
-                        ),
+                        forced_assignments=branch_state.forced_assignments,
+                        same_route_pairs=branch_state.same_route_pairs,
+                        different_route_pairs=branch_state.different_route_pairs,
                     ),
                 ]
+            else:
+                branch_assignment = select_fractional_assignment(
+                    instance=instance,
+                    vehicle_types=vehicle_types,
+                    routes=node_result.routes,
+                    route_values=node_result.route_values,
+                    branch_ctx=branch_ctx,
+                )
+                if branch_assignment is not None:
+                    stop_id, type_id = branch_assignment
+                    if progress is not None:
+                        progress.emit(
+                            f"Branching on stop {stop_id} type assignment {type_id} at node depth {depth}"
+                        )
+                    child_states = [
+                        BranchState(
+                            forbidden_arcs=branch_state.forbidden_arcs,
+                            forced_arcs=branch_state.forced_arcs,
+                            excluded_assignments=frozenset(
+                                set(branch_state.excluded_assignments) | {(stop_id, type_id)}
+                            ),
+                            forced_assignments=branch_state.forced_assignments,
+                            same_route_pairs=branch_state.same_route_pairs,
+                            different_route_pairs=branch_state.different_route_pairs,
+                        ),
+                        BranchState(
+                            forbidden_arcs=branch_state.forbidden_arcs,
+                            forced_arcs=branch_state.forced_arcs,
+                            excluded_assignments=branch_state.excluded_assignments,
+                            forced_assignments=frozenset(
+                                set(branch_state.forced_assignments) | {(stop_id, type_id)}
+                            ),
+                            same_route_pairs=branch_state.same_route_pairs,
+                            different_route_pairs=branch_state.different_route_pairs,
+                        ),
+                    ]
 
         if not child_states:
             raise RuntimeError(
