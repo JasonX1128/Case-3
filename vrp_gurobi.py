@@ -247,6 +247,13 @@ def parse_closed_unit_interval(value: str) -> float:
     return parsed
 
 
+def parse_positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be a positive integer.")
+    return parsed
+
+
 def remaining_time(deadline: float | None) -> float | None:
     if deadline is None:
         return None
@@ -329,6 +336,14 @@ def route_arc_set(stop_sequence: tuple[int, ...]) -> frozenset[tuple[int, int]]:
         arcs.append((stop_sequence[idx], stop_sequence[idx + 1]))
     arcs.append((stop_sequence[-1], DEPOT_NODE))
     return frozenset(arcs)
+
+
+def route_reduced_cost(
+    route: RouteColumn,
+    cover_duals: dict[int, float],
+    type_dual: float,
+) -> float:
+    return route.cost - sum(cover_duals[stop_id] for stop_id in route.stop_sequence) - type_dual
 
 
 def load_instance(workbook_path: Path) -> Instance:
@@ -793,23 +808,28 @@ def solve_pricing_subproblem(
     cover_duals: dict[int, float],
     type_dual: float,
     branch_ctx: BranchContext,
+    max_routes: int,
+    excluded_route_keys: set[tuple[str, tuple[int, ...]]] | None,
     pricing_time_limit: float | None,
     deadline: float | None,
     progress: ProgressTracker | None = None,
     progress_label: str | None = None,
-) -> RouteColumn | None:
+) -> list[RouteColumn]:
+    if max_routes <= 0:
+        return []
     stop_ids = sorted(instance.stops)
     start_limit = vehicle_start_limit(instance, vehicle_type)
     end_limit = vehicle_end_limit(instance, vehicle_type)
     route_horizon = max(end_limit - start_limit, 0.0)
     if route_horizon <= 0:
-        return None
+        return []
 
     pricing_start = perf_counter()
     distance_unit_cost = route_distance_unit_cost(instance, vehicle_type)
     last_forced_stops = {
         i for i, j in branch_ctx.forced_arcs if i != DEPOT_NODE and j == DEPOT_NODE
     }
+    excluded_route_keys = excluded_route_keys or set()
 
     def check_time_limit() -> None:
         now = perf_counter()
@@ -929,7 +949,7 @@ def solve_pricing_subproblem(
         return route
 
     def exact_route_reduced_cost(route: RouteColumn) -> float:
-        return route.cost - sum(cover_duals[stop_id] for stop_id in route.stop_sequence) - type_dual
+        return route_reduced_cost(route, cover_duals=cover_duals, type_dual=type_dual)
 
     def add_label(label: PricingLabel) -> int | None:
         node_labels = labels_at_node[label.node]
@@ -975,6 +995,26 @@ def solve_pricing_subproblem(
             candidates.append(next_stop)
         return candidates
 
+    improving_routes: list[tuple[float, RouteColumn]] = []
+    improving_route_keys: set[tuple[str, tuple[int, ...]]] = set()
+
+    def maybe_add_route(label_idx: int) -> bool:
+        label = label_store[label_idx]
+        if not can_return_from(label):
+            return False
+        if complete_reduced_cost(label) >= -REDUCED_COST_TOL:
+            return False
+        route = reconstruct_route(label_idx)
+        key = (route.type_id, route.stop_sequence)
+        if key in excluded_route_keys or key in improving_route_keys:
+            return False
+        exact_rc = exact_route_reduced_cost(route)
+        if exact_rc >= -REDUCED_COST_TOL:
+            return False
+        improving_route_keys.add(key)
+        improving_routes.append((exact_rc, route))
+        return len(improving_routes) >= max_routes
+
     if progress is not None:
         progress.emit(
             f"{progress_label or f'pricing {vehicle_type.type_id}'}: starting label-setting "
@@ -1011,11 +1051,8 @@ def solve_pricing_subproblem(
                 predecessor_idx=None,
             )
         )
-        if label_idx is not None and can_return_from(label_store[label_idx]):
-            if complete_reduced_cost(label_store[label_idx]) < -REDUCED_COST_TOL:
-                route = reconstruct_route(label_idx)
-                if exact_route_reduced_cost(route) < -REDUCED_COST_TOL:
-                    return route
+        if label_idx is not None and maybe_add_route(label_idx):
+            return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
 
     while frontier:
         _, label_idx = heapq.heappop(frontier)
@@ -1071,14 +1108,11 @@ def solve_pricing_subproblem(
             if new_label_idx is None:
                 continue
 
-            new_label = label_store[new_label_idx]
-            if can_return_from(new_label) and complete_reduced_cost(new_label) < -REDUCED_COST_TOL:
-                route = reconstruct_route(new_label_idx)
-                if exact_route_reduced_cost(route) < -REDUCED_COST_TOL:
-                    return route
+            if maybe_add_route(new_label_idx):
+                return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
 
     check_time_limit()
-    return None
+    return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
 
 
 def build_master_model(
@@ -1225,6 +1259,7 @@ def solve_node_relaxation(
     branch_state: BranchState,
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
+    pricing_columns_per_type: int,
     dual_stabilization_alpha: float,
     dual_stabilization_mode: str,
     deadline: float | None,
@@ -1307,31 +1342,76 @@ def solve_node_relaxation(
         previous_raw_type_duals = raw_type_duals
 
         new_routes: list[RouteColumn] = []
+        found_raw_improving_route = False
         for vehicle_type in vehicle_types.values():
             if progress is not None:
                 progress.emit(
                     f"{node_label}: CG iteration {iteration}, pricing {vehicle_type.type_id} "
                     f"at LP bound {last_lp_objective:.2f}"
                 )
-            route = solve_pricing_subproblem(
+            candidate_routes = solve_pricing_subproblem(
                 instance=instance,
                 vehicle_type=vehicle_type,
                 cover_duals=stabilized_cover_duals,
                 type_dual=stabilized_type_duals[vehicle_type.type_id],
                 branch_ctx=branch_ctx,
+                max_routes=pricing_columns_per_type,
+                excluded_route_keys=route_key_set,
                 pricing_time_limit=pricing_time_limit,
                 deadline=deadline,
                 progress=progress,
                 progress_label=f"{node_label}: pricing {vehicle_type.type_id} in CG iteration {iteration}",
             )
-            if route is None:
-                continue
-            key = (route.type_id, route.stop_sequence)
-            if key not in route_key_set:
+            for route in candidate_routes:
+                if (
+                    route_reduced_cost(
+                        route,
+                        cover_duals=raw_cover_duals,
+                        type_dual=raw_type_duals[vehicle_type.type_id],
+                    )
+                    >= -REDUCED_COST_TOL
+                ):
+                    continue
+                key = (route.type_id, route.stop_sequence)
+                if key in route_key_set:
+                    continue
                 route_key_set.add(key)
                 route_pool.append(route)
                 new_routes.append(route)
                 add_route_column_to_master(node_master, route)
+                found_raw_improving_route = True
+
+        if not found_raw_improving_route and current_alpha < 1.0 - 1e-12:
+            if progress is not None:
+                progress.emit(
+                    f"{node_label}: CG iteration {iteration}, no raw-improving routes found "
+                    "under stabilized pricing; certifying with raw dual pricing"
+                )
+            for vehicle_type in vehicle_types.values():
+                candidate_routes = solve_pricing_subproblem(
+                    instance=instance,
+                    vehicle_type=vehicle_type,
+                    cover_duals=raw_cover_duals,
+                    type_dual=raw_type_duals[vehicle_type.type_id],
+                    branch_ctx=branch_ctx,
+                    max_routes=pricing_columns_per_type,
+                    excluded_route_keys=route_key_set,
+                    pricing_time_limit=pricing_time_limit,
+                    deadline=deadline,
+                    progress=progress,
+                    progress_label=(
+                        f"{node_label}: raw pricing {vehicle_type.type_id} "
+                        f"in CG iteration {iteration}"
+                    ),
+                )
+                for route in candidate_routes:
+                    key = (route.type_id, route.stop_sequence)
+                    if key in route_key_set:
+                        continue
+                    route_key_set.add(key)
+                    route_pool.append(route)
+                    new_routes.append(route)
+                    add_route_column_to_master(node_master, route)
 
         if not new_routes:
             artificial_usage = sum(
@@ -1488,6 +1568,7 @@ def create_model(
     workbook_path: Path,
     max_cg_iterations: int | None = 200,
     pricing_time_limit: float | None = None,
+    pricing_columns_per_type: int = 3,
     dual_stabilization_alpha: float = 0.5,
     dual_stabilization_mode: str = "adaptive",
 ) -> tuple[gp.Model, dict[str, Any]]:
@@ -1510,6 +1591,7 @@ def create_model(
         branch_state=root_state,
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
+        pricing_columns_per_type=pricing_columns_per_type,
         dual_stabilization_alpha=dual_stabilization_alpha,
         dual_stabilization_mode=dual_stabilization_mode,
         deadline=None,
@@ -1532,6 +1614,7 @@ def create_model(
             "cg_iterations": root_result.cg_iterations,
             "lp_objective": root_result.lower_bound,
             "column_count": len(root_result.routes),
+            "pricing_columns_per_type": pricing_columns_per_type,
             "dual_stabilization_alpha": dual_stabilization_alpha,
             "dual_stabilization_mode": dual_stabilization_mode,
             "note": (
@@ -1549,6 +1632,7 @@ def branch_and_price(
     mip_gap: float | None,
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
+    pricing_columns_per_type: int,
     dual_stabilization_alpha: float,
     dual_stabilization_mode: str,
     max_bp_nodes: int | None,
@@ -1632,6 +1716,7 @@ def branch_and_price(
                 branch_state=branch_state,
                 max_cg_iterations=max_cg_iterations,
                 pricing_time_limit=pricing_time_limit,
+                pricing_columns_per_type=pricing_columns_per_type,
                 dual_stabilization_alpha=dual_stabilization_alpha,
                 dual_stabilization_mode=dual_stabilization_mode,
                 deadline=deadline,
@@ -1833,6 +1918,7 @@ def solve_model(
     mip_gap: float | None,
     max_cg_iterations: int | None,
     pricing_time_limit: float | None,
+    pricing_columns_per_type: int,
     dual_stabilization_alpha: float,
     dual_stabilization_mode: str,
     max_bp_nodes: int | None,
@@ -1846,6 +1932,7 @@ def solve_model(
         mip_gap=mip_gap,
         max_cg_iterations=max_cg_iterations,
         pricing_time_limit=pricing_time_limit,
+        pricing_columns_per_type=pricing_columns_per_type,
         dual_stabilization_alpha=dual_stabilization_alpha,
         dual_stabilization_mode=dual_stabilization_mode,
         max_bp_nodes=max_bp_nodes,
@@ -1952,7 +2039,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional per-pricing time limit in seconds. "
-            "If a pricing MIP hits this limit, the exact solve aborts."
+            "If a pricing solve hits this limit, the exact solve aborts."
+        ),
+    )
+    parser.add_argument(
+        "--pricing-columns-per-type",
+        type=parse_positive_int,
+        default=3,
+        help=(
+            "Maximum number of distinct improving routes to add per vehicle type in each "
+            "column-generation iteration."
         ),
     )
     parser.add_argument(
@@ -2021,6 +2117,7 @@ def main() -> None:
         mip_gap=args.mip_gap,
         max_cg_iterations=args.max_cg_iterations,
         pricing_time_limit=args.pricing_time_limit,
+        pricing_columns_per_type=args.pricing_columns_per_type,
         dual_stabilization_alpha=args.dual_stabilization_alpha,
         dual_stabilization_mode=args.dual_stabilization_mode,
         max_bp_nodes=args.max_bp_nodes,
