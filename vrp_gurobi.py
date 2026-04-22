@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time
@@ -486,16 +487,29 @@ def route_distance_unit_cost(instance: Instance, vehicle_type: VehicleTypeData) 
     )
 
 
+def billed_operating_hours(active_min: float) -> int:
+    if active_min <= 1e-9:
+        return 0
+    return math.ceil(max(active_min - 1e-9, 0.0) / 60.0)
+
+
+def operating_labor_cost(instance: Instance, active_min: float) -> float:
+    return billed_operating_hours(active_min) * instance.cost_params["Driver_Hourly_Wage"]
+
+
 def incremental_labor_cost(
     instance: Instance,
     elapsed_before_min: float,
     delta_min: float,
 ) -> float:
-    del elapsed_before_min
     if delta_min <= 0:
         return 0.0
 
-    return delta_min / 60.0 * instance.cost_params["Driver_Hourly_Wage"]
+    elapsed_after_min = max(elapsed_before_min + delta_min, 0.0)
+    return operating_labor_cost(instance, elapsed_after_min) - operating_labor_cost(
+        instance,
+        max(elapsed_before_min, 0.0),
+    )
 
 
 def evaluate_route_sequence(
@@ -537,7 +551,7 @@ def evaluate_route_sequence(
 
     cost = vehicle_type.fixed_daily_cost
     cost += distance_mi * route_distance_unit_cost(instance, vehicle_type)
-    cost += active_min / 60.0 * instance.cost_params["Driver_Hourly_Wage"]
+    cost += operating_labor_cost(instance, active_min)
     cost += sum(late_min.values()) / 60.0 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
 
     return RouteColumn(
