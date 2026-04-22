@@ -479,10 +479,6 @@ def vehicle_end_limit(instance: Instance, vehicle_type: VehicleTypeData) -> floa
     return min(vehicle_type.available_until_min, instance.depot_close_min)
 
 
-def regular_limit_minutes(instance: Instance) -> float:
-    return 60.0 * instance.cost_params["Regular_Hours_Before_Overtime"]
-
-
 def route_distance_unit_cost(instance: Instance, vehicle_type: VehicleTypeData) -> float:
     return vehicle_type.cost_per_mile + (
         instance.cost_params["Fuel_Cost_per_Liter"]
@@ -495,16 +491,11 @@ def incremental_labor_cost(
     elapsed_before_min: float,
     delta_min: float,
 ) -> float:
+    del elapsed_before_min
     if delta_min <= 0:
         return 0.0
 
-    regular_remaining = max(regular_limit_minutes(instance) - elapsed_before_min, 0.0)
-    regular_piece = min(delta_min, regular_remaining)
-    overtime_piece = max(delta_min - regular_piece, 0.0)
-    return (
-        regular_piece / 60.0 * instance.cost_params["Driver_Hourly_Wage"]
-        + overtime_piece / 60.0 * instance.cost_params["Overtime_Hourly_Rate"]
-    )
+    return delta_min / 60.0 * instance.cost_params["Driver_Hourly_Wage"]
 
 
 def evaluate_route_sequence(
@@ -543,13 +534,10 @@ def evaluate_route_sequence(
         return None
 
     active_min = return_min - start_limit
-    regular_min = min(active_min, regular_limit_minutes(instance))
-    overtime_min = max(active_min - regular_min, 0.0)
 
     cost = vehicle_type.fixed_daily_cost
     cost += distance_mi * route_distance_unit_cost(instance, vehicle_type)
-    cost += regular_min / 60.0 * instance.cost_params["Driver_Hourly_Wage"]
-    cost += overtime_min / 60.0 * instance.cost_params["Overtime_Hourly_Rate"]
+    cost += active_min / 60.0 * instance.cost_params["Driver_Hourly_Wage"]
     cost += sum(late_min.values()) / 60.0 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
 
     return RouteColumn(
