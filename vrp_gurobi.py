@@ -24,6 +24,9 @@ REDUCED_COST_TOL = 1e-6
 INTEGRALITY_TOL = 1e-6
 HEURISTIC_MASTER_TIME_LIMIT = 5.0
 ARTIFICIAL_COVER_PENALTY = 1_000_000.0
+INITIAL_ACTIVE_COVER_CANDIDATES_PER_STOP = 3
+INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE = 12
+INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
 
 _PRICING_WORKER_INSTANCE: Instance | None = None
 _PRICING_WORKER_BRANCH_CTX: BranchContext | None = None
@@ -369,6 +372,94 @@ def route_reduced_cost(
     type_dual: float,
 ) -> float:
     return route.cost - sum(cover_duals[stop_id] for stop_id in route.stop_sequence) - type_dual
+
+
+def route_column_key(route: RouteColumn) -> tuple[str, tuple[int, ...]]:
+    return route.type_id, route.stop_sequence
+
+
+def select_initial_active_routes(
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    compatible_routes: list[RouteColumn],
+) -> list[RouteColumn]:
+    if not compatible_routes:
+        return []
+
+    active_keys: set[tuple[str, tuple[int, ...]]] = set()
+    routes_by_type: dict[str, list[RouteColumn]] = {type_id: [] for type_id in vehicle_types}
+    routes_by_stop: dict[int, list[RouteColumn]] = {stop_id: [] for stop_id in instance.stops}
+
+    for route in compatible_routes:
+        routes_by_type[route.type_id].append(route)
+        for stop_id in route.stop_set:
+            routes_by_stop[stop_id].append(route)
+
+    for stop_id, covering_routes in routes_by_stop.items():
+        for route in sorted(
+            covering_routes,
+            key=lambda candidate: (
+                candidate.cost,
+                len(candidate.stop_sequence),
+                candidate.return_min,
+                candidate.stop_sequence,
+            ),
+        )[:INITIAL_ACTIVE_COVER_CANDIDATES_PER_STOP]:
+            active_keys.add(route_column_key(route))
+
+    for type_id, typed_routes in routes_by_type.items():
+        cheapest_routes = sorted(
+            typed_routes,
+            key=lambda candidate: (
+                candidate.cost,
+                len(candidate.stop_sequence),
+                candidate.return_min,
+                candidate.stop_sequence,
+            ),
+        )[:INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE]
+        for route in cheapest_routes:
+            active_keys.add(route_column_key(route))
+
+        for route in typed_routes[-INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE:]:
+            active_keys.add(route_column_key(route))
+
+    return [route for route in compatible_routes if route_column_key(route) in active_keys]
+
+
+def select_inactive_reactivation_routes(
+    inactive_routes_by_type: dict[str, dict[tuple[str, tuple[int, ...]], RouteColumn]],
+    cover_duals: dict[int, float],
+    type_duals: dict[str, float],
+    max_per_type: int,
+) -> list[RouteColumn]:
+    selected_routes: list[RouteColumn] = []
+    for type_id, inactive_routes in inactive_routes_by_type.items():
+        improving_routes = [
+            (
+                route_reduced_cost(
+                    route,
+                    cover_duals=cover_duals,
+                    type_dual=type_duals[type_id],
+                ),
+                route,
+            )
+            for route in inactive_routes.values()
+        ]
+        improving_routes = [
+            (reduced_cost, route)
+            for reduced_cost, route in improving_routes
+            if reduced_cost < -REDUCED_COST_TOL
+        ]
+        improving_routes.sort(
+            key=lambda item: (
+                item[0],
+                item[1].cost,
+                len(item[1].stop_sequence),
+                item[1].stop_sequence,
+            )
+        )
+        selected_routes.extend(route for _, route in improving_routes[:max_per_type])
+    return selected_routes
 
 
 def init_pricing_worker(instance: Instance, branch_ctx: BranchContext) -> None:
@@ -1588,15 +1679,23 @@ def solve_node_relaxation(
         return None
 
     compatible_routes = [route for route in route_pool if route_is_compatible(route, branch_ctx)]
+    initial_active_routes = select_initial_active_routes(
+        instance=instance,
+        vehicle_types=vehicle_types,
+        compatible_routes=compatible_routes,
+    )
+    if not initial_active_routes:
+        initial_active_routes = compatible_routes[:]
     node_master = build_incremental_node_master(
         instance=instance,
         vehicle_types=vehicle_types,
-        routes=compatible_routes,
+        routes=initial_active_routes,
     )
     last_lp_objective = float("nan")
     if progress is not None:
         progress.emit(
-            f"{node_label}: starting node relaxation with {len(compatible_routes)} compatible columns",
+            f"{node_label}: starting node relaxation with {len(initial_active_routes)} active "
+            f"columns out of {len(compatible_routes)} compatible global columns",
             force=True,
         )
 
@@ -1606,6 +1705,15 @@ def solve_node_relaxation(
     for type_id, stop_sequence in route_key_set:
         if type_id in route_sequences_by_type:
             route_sequences_by_type[type_id].add(stop_sequence)
+
+    inactive_routes_by_type: dict[str, dict[tuple[str, tuple[int, ...]], RouteColumn]] = {
+        type_id: {} for type_id in vehicle_types
+    }
+    active_route_keys = {route_column_key(route) for route in initial_active_routes}
+    for route in compatible_routes:
+        key = route_column_key(route)
+        if key not in active_route_keys:
+            inactive_routes_by_type[route.type_id][key] = route
 
     effective_pricing_workers = (
         min(pricing_workers, len(vehicle_types))
@@ -1748,6 +1856,34 @@ def solve_node_relaxation(
             previous_raw_type_duals = raw_type_duals
 
             new_routes: list[RouteColumn] = []
+            reactivated_routes = select_inactive_reactivation_routes(
+                inactive_routes_by_type=inactive_routes_by_type,
+                cover_duals=raw_cover_duals,
+                type_duals=raw_type_duals,
+                max_per_type=pricing_columns_per_type,
+            )
+            for route in reactivated_routes:
+                key = route_column_key(route)
+                if key in active_route_keys:
+                    continue
+                inactive_routes_by_type[route.type_id].pop(key, None)
+                active_route_keys.add(key)
+                new_routes.append(route)
+                add_route_column_to_master(node_master, route)
+            if reactivated_routes and progress is not None:
+                progress.emit(
+                    f"{node_label}: CG iteration {iteration} reactivated {len(reactivated_routes)} "
+                    "stored columns from global memory"
+                )
+            if reactivated_routes:
+                if progress is not None:
+                    progress.emit(
+                        f"{node_label}: CG iteration {iteration} added {len(new_routes)} routes; "
+                        f"global column pool is now {len(route_pool)}"
+                    )
+                node_master.model.update()
+                continue
+
             found_raw_improving_route = False
             pricing_results = collect_candidate_routes(
                 cover_duals=stabilized_cover_duals,
@@ -1772,6 +1908,7 @@ def solve_node_relaxation(
                         continue
                     route_key_set.add(key)
                     route_sequences_by_type[route.type_id].add(route.stop_sequence)
+                    active_route_keys.add(key)
                     route_pool.append(route)
                     new_routes.append(route)
                     add_route_column_to_master(node_master, route)
@@ -1796,6 +1933,7 @@ def solve_node_relaxation(
                             continue
                         route_key_set.add(key)
                         route_sequences_by_type[route.type_id].add(route.stop_sequence)
+                        active_route_keys.add(key)
                         route_pool.append(route)
                         new_routes.append(route)
                         add_route_column_to_master(node_master, route)
