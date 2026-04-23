@@ -206,6 +206,7 @@ _MISSING = object()
 class StopData:
     stop_id: int
     customer_name: str
+    address: str
     demand_kg: float
     earliest_min: float
     latest_min: float
@@ -1736,6 +1737,7 @@ def load_instance(workbook_path: Path) -> Instance:
         stops[stop_id] = StopData(
             stop_id=stop_id,
             customer_name=str(ws_stops[f"B{row}"].value),
+            address=str(ws_stops[f"C{row}"].value),
             demand_kg=float(ws_stops[f"D{row}"].value),
             earliest_min=excel_time_to_minutes(ws_stops[f"E{row}"].value),
             latest_min=excel_time_to_minutes(ws_stops[f"F{row}"].value),
@@ -1790,6 +1792,25 @@ def load_instance(workbook_path: Path) -> Instance:
         depot_open_min=depot_open_min,
         depot_close_min=depot_close_min,
     )
+
+
+def format_stop_reference(stop: StopData) -> str:
+    if stop.address:
+        return f"Stop {stop.stop_id}: {stop.customer_name} | {stop.address}"
+    return f"Stop {stop.stop_id}: {stop.customer_name}"
+
+
+def format_stop_detail_label(stop: StopData) -> str:
+    if stop.address:
+        return f"Stop {stop.stop_id} ({stop.customer_name}, {stop.address})"
+    return f"Stop {stop.stop_id} ({stop.customer_name})"
+
+
+def print_stop_reference(instance: Instance) -> None:
+    print("Stop reference:")
+    for stop_id in sorted(instance.stops):
+        print(f"  {format_stop_reference(instance.stops[stop_id])}")
+    print()
 
 
 def validate_shared_cost_assumptions(instance: Instance) -> None:
@@ -2774,6 +2795,7 @@ def solve_arc_flow_model(
 
     try:
         instance = load_instance(workbook_path)
+        print_stop_reference(instance)
         model, data = build_arc_flow_model(instance)
 
         if mip_profile is not None:
@@ -2973,7 +2995,8 @@ def solve_arc_flow_model(
                     continue
                 print(
                     "    "
-                    f"Stop {stop_id}: start {minutes_to_clock(vehicle_solution.service_start_min[stop_id])}, "
+                    f"{format_stop_detail_label(instance.stops[stop_id])}: "
+                    f"start {minutes_to_clock(vehicle_solution.service_start_min[stop_id])}, "
                     f"late {vehicle_solution.late_min[stop_id]:.1f} min"
                 )
             print()
@@ -5372,6 +5395,7 @@ def solve_model(
     resume_from: Path | None = None,
 ) -> BranchAndPriceResult:
     instance = load_instance(workbook_path)
+    print_stop_reference(instance)
     result = branch_and_price(
         instance=instance,
         workbook_path=workbook_path,
@@ -5451,7 +5475,8 @@ def solve_model(
             late = route.late_min[stop_id]
             print(
                 "    "
-                f"Stop {stop_id}: start {minutes_to_clock(start)}, "
+                f"{format_stop_detail_label(instance.stops[stop_id])}: "
+                f"start {minutes_to_clock(start)}, "
                 f"early {early:.1f} min, late {late:.1f} min"
             )
         print()
