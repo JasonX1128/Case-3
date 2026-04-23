@@ -68,6 +68,14 @@ class MandatoryLunchBreakRule:
         return self.window_end_min - self.duration_min
 
 
+@dataclass(frozen=True)
+class StopServiceWindowRule:
+    stop_id: int
+    earliest_min: float | None
+    latest_min: float | None
+    description: str
+
+
 REDSTONE_PLAZA_PAIR_RULES: tuple[RequiredAdjacentStopPairRule, ...] = (
     RequiredAdjacentStopPairRule(
         stop_a=7,
@@ -78,6 +86,24 @@ REDSTONE_PLAZA_PAIR_RULES: tuple[RequiredAdjacentStopPairRule, ...] = (
         ),
     ),
 )
+
+HARD_STOP_SERVICE_WINDOW_RULES: tuple[StopServiceWindowRule, ...] = (
+    StopServiceWindowRule(
+        stop_id=3,
+        earliest_min=12.0 * 60.0,
+        latest_min=None,
+        description="Redstone Medical Center (Stop 3) may not be served before 12:00 PM.",
+    ),
+    StopServiceWindowRule(
+        stop_id=14,
+        earliest_min=10.0 * 60.0,
+        latest_min=None,
+        description="Sunrise Senior Living (Stop 14) may not be served before 10:00 AM.",
+    ),
+)
+HARD_STOP_SERVICE_WINDOW_RULE_BY_STOP = {
+    rule.stop_id: rule for rule in HARD_STOP_SERVICE_WINDOW_RULES
+}
 
 MIDDAY_LUNCH_BREAK_RULE = MandatoryLunchBreakRule(
     window_start_min=11.5 * 60.0,
@@ -1743,7 +1769,6 @@ def load_instance(workbook_path: Path) -> Instance:
             latest_min=excel_time_to_minutes(ws_stops[f"F{row}"].value),
             service_min=float(ws_stops[f"G{row}"].value),
         )
-
     vehicles: dict[int, VehicleData] = {}
     for row in range(2, ws_vehicles.max_row + 1):
         vehicle_id = int(ws_vehicles[f"A{row}"].value)
@@ -1804,6 +1829,20 @@ def format_stop_detail_label(stop: StopData) -> str:
     if stop.address:
         return f"Stop {stop.stop_id} ({stop.customer_name}, {stop.address})"
     return f"Stop {stop.stop_id} ({stop.customer_name})"
+
+
+def format_route_stop_ids(route: tuple[int, ...]) -> str:
+    stop_ids = [str(node) for node in route if node != DEPOT_NODE]
+    return ", ".join(stop_ids) if stop_ids else "(empty)"
+
+
+def format_route_stop_details(instance: Instance, route: tuple[int, ...]) -> str:
+    stops = [
+        format_stop_detail_label(instance.stops[node])
+        for node in route
+        if node != DEPOT_NODE
+    ]
+    return " -> ".join(stops) if stops else "(empty)"
 
 
 def print_stop_reference(instance: Instance) -> None:
@@ -1903,10 +1942,29 @@ def incremental_labor_cost(
 
 
 def active_business_rule_descriptions() -> list[str]:
-    descriptions = [rule.description for rule in REDSTONE_PLAZA_PAIR_RULES]
+    descriptions = [rule.description for rule in HARD_STOP_SERVICE_WINDOW_RULES]
+    descriptions.extend(rule.description for rule in REDSTONE_PLAZA_PAIR_RULES)
     if MIDDAY_LUNCH_BREAK_RULE is not None:
         descriptions.append(MIDDAY_LUNCH_BREAK_RULE.description)
     return descriptions
+
+
+def hard_service_start_lb(stop_id: int) -> float | None:
+    rule = HARD_STOP_SERVICE_WINDOW_RULE_BY_STOP.get(stop_id)
+    if rule is None:
+        return None
+    return rule.earliest_min
+
+
+def hard_service_start_after_arrival(stop_id: int, arrival_min: float) -> float:
+    earliest_min = hard_service_start_lb(stop_id)
+    if earliest_min is None:
+        return arrival_min
+    return max(arrival_min, earliest_min)
+
+
+def hard_service_finish_after_arrival(stop: StopData, arrival_min: float) -> float:
+    return hard_service_start_after_arrival(stop.stop_id, arrival_min) + stop.service_min
 
 
 def lunch_break_interval_after(current_time_min: float) -> tuple[float, float] | None:
@@ -1981,10 +2039,10 @@ def simulate_stop_sequence_timing(
 
     for idx, stop_id in enumerate(stop_sequence):
         stop = instance.stops[stop_id]
-        current_time += instance.travel_minutes[current_node, stop_id]
-        service_start_min[stop_id] = current_time
-        late_min[stop_id] = max(current_time - stop.latest_min, 0.0)
-        current_time += stop.service_min
+        arrival_min = current_time + instance.travel_minutes[current_node, stop_id]
+        service_start_min[stop_id] = hard_service_start_after_arrival(stop_id, arrival_min)
+        late_min[stop_id] = max(service_start_min[stop_id] - stop.latest_min, 0.0)
+        current_time = service_start_min[stop_id] + stop.service_min
         current_node = stop_id
         if not maybe_take_lunch(idx + 1):
             return None
@@ -2141,6 +2199,9 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         for stop_id in stop_ids:
             stop = instance.stops[stop_id]
             lb = start_limit[vehicle_id] + instance.travel_minutes[DEPOT_NODE, stop_id]
+            hard_lb = hard_service_start_lb(stop_id)
+            if hard_lb is not None:
+                lb = max(lb, hard_lb)
             ub = end_limit[vehicle_id] - stop.service_min - instance.travel_minutes[stop_id, DEPOT_NODE]
             feasible = stop.demand_kg <= vehicle.capacity_kg + 1e-9 and lb <= ub + 1e-9
             vehicle_stop_lb[vehicle_id, stop_id] = lb
@@ -2148,7 +2209,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             feasible_vehicle_stop[vehicle_id, stop_id] = feasible
             if feasible:
                 feasible_round_trips.append(
-                    instance.travel_minutes[DEPOT_NODE, stop_id]
+                    (lb - start_limit[vehicle_id])
                     + stop.service_min
                     + instance.travel_minutes[stop_id, DEPOT_NODE]
                 )
@@ -2983,12 +3044,10 @@ def solve_arc_flow_model(
                 f"Distance cost {vehicle_solution.distance_cost:.2f}, "
                 f"Route cost {vehicle_solution.route_cost:.2f}"
             )
+            print(f"  Route IDs: {format_route_stop_ids(vehicle_solution.route)}")
             print(
-                "  Route: "
-                + " -> ".join(
-                    "Depot" if node == DEPOT_NODE else f"Stop {node}"
-                    for node in vehicle_solution.route
-                )
+                "  Route detail: "
+                f"{format_route_stop_details(instance, vehicle_solution.route)}"
             )
             for stop_id in vehicle_solution.route:
                 if stop_id == DEPOT_NODE:
@@ -3385,10 +3444,9 @@ def solve_pricing_subproblem(
 
     for stop_id in stop_ids:
         stop = instance.stops[stop_id]
-        finish_time = (
-            start_limit
-            + instance.travel_minutes[DEPOT_NODE, stop_id]
-            + stop.service_min
+        finish_time = hard_service_finish_after_arrival(
+            stop,
+            start_limit + instance.travel_minutes[DEPOT_NODE, stop_id],
         )
         assignment_allowed = True
         forced_type = branch_ctx.forced_type_for_stop.get(stop_id)
@@ -3409,20 +3467,18 @@ def solve_pricing_subproblem(
     for i in stop_ids:
         if not feasible_stop[i]:
             continue
-        earliest_depart_i = (
-            start_limit
-            + instance.travel_minutes[DEPOT_NODE, i]
-            + instance.stops[i].service_min
+        earliest_depart_i = hard_service_finish_after_arrival(
+            instance.stops[i],
+            start_limit + instance.travel_minutes[DEPOT_NODE, i],
         )
         for j in stop_ids:
             if i == j or not feasible_stop[j]:
                 continue
             if (i, j) in branch_ctx.forbidden_arcs:
                 continue
-            earliest_finish_j = (
-                earliest_depart_i
-                + instance.travel_minutes[i, j]
-                + instance.stops[j].service_min
+            earliest_finish_j = hard_service_finish_after_arrival(
+                instance.stops[j],
+                earliest_depart_i + instance.travel_minutes[i, j],
             )
             if earliest_finish_j + instance.travel_minutes[j, DEPOT_NODE] <= end_limit + 1e-9:
                 potential_successors[i].append(j)
@@ -3778,22 +3834,24 @@ def solve_pricing_subproblem(
 
         stop = instance.stops[start_stop]
         arrival = start_limit + instance.travel_minutes[DEPOT_NODE, start_stop]
-        time_after_service = arrival + stop.service_min
+        service_start = hard_service_start_after_arrival(start_stop, arrival)
+        time_after_service = service_start + stop.service_min
         start_transition_options: list[tuple[bool, float, float]] = []
         if (
             MIDDAY_LUNCH_BREAK_RULE is None
             or time_after_service <= MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9
         ):
-            start_transition_options.append((False, arrival, time_after_service))
+            start_transition_options.append((False, service_start, time_after_service))
 
         lunch_window = lunch_break_interval_after(start_limit)
         if MIDDAY_LUNCH_BREAK_RULE is not None and lunch_window is not None:
             _, break_end = lunch_window
             lunch_arrival = break_end + instance.travel_minutes[DEPOT_NODE, start_stop]
-            lunch_time_after_service = lunch_arrival + stop.service_min
-            start_transition_options.append((True, lunch_arrival, lunch_time_after_service))
+            lunch_service_start = hard_service_start_after_arrival(start_stop, lunch_arrival)
+            lunch_time_after_service = lunch_service_start + stop.service_min
+            start_transition_options.append((True, lunch_service_start, lunch_time_after_service))
 
-        for lunch_break_taken, arrival_min, service_finish_min in start_transition_options:
+        for lunch_break_taken, service_start_min, service_finish_min in start_transition_options:
             if service_finish_min + instance.travel_minutes[start_stop, DEPOT_NODE] > end_limit + 1e-9:
                 continue
             elapsed = service_finish_min - start_limit
@@ -3802,7 +3860,7 @@ def solve_pricing_subproblem(
                 - type_dual
                 + instance.distance_miles[DEPOT_NODE, start_stop] * distance_unit_cost
                 + incremental_labor_cost(instance, 0.0, elapsed)
-                + max(arrival_min - stop.latest_min, 0.0)
+                + max(service_start_min - stop.latest_min, 0.0)
                 / 60.0
                 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
                 - cover_duals[start_stop]
@@ -3848,7 +3906,8 @@ def solve_pricing_subproblem(
             transition_options: list[tuple[bool, float, float, float]] = []
 
             arrival = label.time_after_service + instance.travel_minutes[label.node, next_stop]
-            time_after_service = arrival + next_stop_data.service_min
+            service_start = hard_service_start_after_arrival(next_stop, arrival)
+            time_after_service = service_start + next_stop_data.service_min
             if (
                 MIDDAY_LUNCH_BREAK_RULE is None
                 or label.lunch_break_taken
@@ -3857,9 +3916,9 @@ def solve_pricing_subproblem(
                 transition_options.append(
                     (
                         label.lunch_break_taken,
-                        arrival,
+                        service_start,
                         time_after_service,
-                        instance.travel_minutes[label.node, next_stop] + next_stop_data.service_min,
+                        time_after_service - label.time_after_service,
                     )
                 )
 
@@ -3868,19 +3927,18 @@ def solve_pricing_subproblem(
                 if lunch_window is not None:
                     _, break_end = lunch_window
                     lunch_arrival = break_end + instance.travel_minutes[label.node, next_stop]
-                    lunch_time_after_service = lunch_arrival + next_stop_data.service_min
+                    lunch_service_start = hard_service_start_after_arrival(next_stop, lunch_arrival)
+                    lunch_time_after_service = lunch_service_start + next_stop_data.service_min
                     transition_options.append(
                         (
                             True,
-                            lunch_arrival,
+                            lunch_service_start,
                             lunch_time_after_service,
-                            (break_end - label.time_after_service)
-                            + instance.travel_minutes[label.node, next_stop]
-                            + next_stop_data.service_min,
+                            lunch_time_after_service - label.time_after_service,
                         )
                     )
 
-            for lunch_break_taken, arrival_min, service_finish_min, delta_minutes in transition_options:
+            for lunch_break_taken, service_start_min, service_finish_min, delta_minutes in transition_options:
                 if service_finish_min + instance.travel_minutes[next_stop, DEPOT_NODE] > end_limit + 1e-9:
                     continue
 
@@ -3888,7 +3946,7 @@ def solve_pricing_subproblem(
                     label.reduced_cost
                     + instance.distance_miles[label.node, next_stop] * distance_unit_cost
                     + incremental_labor_cost(instance, elapsed_before, delta_minutes)
-                    + max(arrival_min - next_stop_data.latest_min, 0.0)
+                    + max(service_start_min - next_stop_data.latest_min, 0.0)
                     / 60.0
                     * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
                     - cover_duals[next_stop]
@@ -3905,7 +3963,7 @@ def solve_pricing_subproblem(
                         nonlabor_reduced_cost=(
                             label.nonlabor_reduced_cost
                             + instance.distance_miles[label.node, next_stop] * distance_unit_cost
-                            + max(arrival_min - next_stop_data.latest_min, 0.0)
+                            + max(service_start_min - next_stop_data.latest_min, 0.0)
                             / 60.0
                             * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
                             - cover_duals[next_stop]
@@ -5463,11 +5521,11 @@ def solve_model(
                 f"Lunch break {minutes_to_clock(route.lunch_break_start_min)}-"
                 f"{minutes_to_clock(lunch_end)}"
             )
+        route_with_depot = (DEPOT_NODE,) + route.stop_sequence + (DEPOT_NODE,)
+        print(f"  Route IDs: {format_route_stop_ids(route_with_depot)}")
         print(
-            "  Route: "
-            + " -> ".join(
-                ["Depot"] + [f"Stop {stop_id}" for stop_id in route.stop_sequence] + ["Depot"]
-            )
+            "  Route detail: "
+            f"{format_route_stop_details(instance, route_with_depot)}"
         )
         for stop_id in route.stop_sequence:
             start = route.service_start_min[stop_id]
