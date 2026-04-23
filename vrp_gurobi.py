@@ -246,6 +246,7 @@ _PRICING_WORKER_INSTANCE: Instance | None = None
 _PRICING_WORKER_BRANCH_CTX: BranchContext | None = None
 _INTERRUPT_SIGNAL_NAME: str | None = None
 _GUROBI_ENV: gp.Env | None = None
+_LATEST_INTERRUPT_ARTIFACTS: dict[str, Path] = {}
 _MISSING = object()
 
 
@@ -1487,6 +1488,44 @@ def default_mip_bound_plot_path(workbook_path: Path, run_timestamp: str) -> Path
 
 def default_mip_persist_dir(workbook_path: Path) -> Path:
     return workbook_path.parent / ".mip_persist" / workbook_path.stem
+
+
+def record_interrupt_artifact(label: str, path: Path | None) -> None:
+    if path is None:
+        return
+    _LATEST_INTERRUPT_ARTIFACTS[label] = path.resolve()
+
+
+def default_interrupt_artifact_report_path(workbook_path: Path) -> Path:
+    return workbook_path.parent / f"{workbook_path.stem}_interrupt_artifacts.txt"
+
+
+def default_interrupt_incumbent_report_path(workbook_path: Path) -> Path:
+    return workbook_path.parent / f"{workbook_path.stem}_interrupt_incumbent_report.txt"
+
+
+def write_interrupt_artifact_report(
+    report_path: Path,
+    *,
+    workbook_path: Path,
+    interrupt_note: str,
+) -> Path:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"saved_at: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"workbook_path: {workbook_path.resolve()}",
+        f"interrupt_note: {interrupt_note}",
+    ]
+    for label, path in sorted(_LATEST_INTERRUPT_ARTIFACTS.items()):
+        lines.append(f"{label}: {path}")
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report_path
+
+
+def write_text_report(report_path: Path, text: str) -> Path:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(text, encoding="utf-8")
+    return report_path
 
 
 def install_interrupt_handlers() -> dict[int, Any]:
@@ -2873,6 +2912,252 @@ def extract_arc_flow_route(data: dict[str, Any], vehicle_id: int) -> tuple[int, 
     return tuple(route)
 
 
+def extract_arc_flow_vehicle_solutions(
+    instance: Instance,
+    data: dict[str, Any],
+) -> list[ArcFlowVehicleSolution]:
+    vehicle_solutions: list[ArcFlowVehicleSolution] = []
+    for vehicle_id in data["vehicle_ids"]:
+        if data["use_vehicle"][vehicle_id].X < 0.5:
+            continue
+        vehicle = instance.vehicles[vehicle_id]
+        route = extract_arc_flow_route(data, vehicle_id)
+        served_stops = [stop_id for stop_id in route if stop_id != DEPOT_NODE]
+        service_start_min = {
+            stop_id: data["service_start_min"][stop_id].X for stop_id in served_stops
+        }
+        late_min = {stop_id: data["late_min"][stop_id].X for stop_id in served_stops}
+        lunch_break_start_min = (
+            data["lunch_start_min"][vehicle_id].X
+            if data["lunch_required"][vehicle_id].X > 0.5
+            else None
+        )
+        distance_cost = data["distance_cost_expr"][vehicle_id].getValue()
+        billed_hours = int(round(data["billed_hours"][vehicle_id].X))
+        route_cost = (
+            vehicle.fixed_daily_cost
+            + distance_cost
+            + billed_hours * instance.cost_params["Driver_Hourly_Wage"]
+            + sum(late_min.values()) / 60.0 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+        )
+        vehicle_solutions.append(
+            ArcFlowVehicleSolution(
+                vehicle_id=vehicle_id,
+                vehicle=vehicle,
+                route=route,
+                load_kg=sum(instance.stops[stop_id].demand_kg for stop_id in served_stops),
+                depart_min=data["depart_min"][vehicle_id].X,
+                return_min=data["return_min"][vehicle_id].X,
+                drive_min=data["drive_min_expr"][vehicle_id].getValue(),
+                service_min=data["service_min_expr"][vehicle_id].getValue(),
+                active_min=data["active_min_expr"][vehicle_id].getValue(),
+                billed_hours=billed_hours,
+                distance_cost=distance_cost,
+                route_cost=route_cost,
+                service_start_min=service_start_min,
+                late_min=late_min,
+                lunch_break_start_min=lunch_break_start_min,
+            )
+        )
+    return vehicle_solutions
+
+
+def render_arc_flow_vehicle_solution_report(
+    instance: Instance,
+    vehicle_solutions: list[ArcFlowVehicleSolution],
+    *,
+    status: str,
+    objective: float | None,
+    best_bound: float | None,
+    gap: float | None,
+) -> str:
+    lines = [
+        f"Status: {status}",
+        "Formulation: Arc-Flow MIP with Vehicle Symmetry Breaking",
+    ]
+    if best_bound is not None:
+        lines.append(f"Best bound: {best_bound:.2f}")
+    if objective is not None:
+        lines.append(f"Objective value: {objective:.2f}")
+    if gap is not None:
+        lines.append(f"Relative gap: {100.0 * gap:.2f}%")
+    lines.append("")
+
+    if not vehicle_solutions:
+        lines.append("No feasible incumbent route set found.")
+        return "\n".join(lines) + "\n"
+
+    for vehicle_solution in vehicle_solutions:
+        lines.append(f"Vehicle {vehicle_solution.vehicle_id} ({vehicle_solution.vehicle.vehicle_type})")
+        lines.append(
+            "  "
+            f"Depart {minutes_to_clock(vehicle_solution.depart_min)}, "
+            f"Return {minutes_to_clock(vehicle_solution.return_min)}, "
+            f"Load {vehicle_solution.load_kg:.0f} / {vehicle_solution.vehicle.capacity_kg:.0f} kg"
+        )
+        lines.append(
+            "  "
+            f"Active {vehicle_solution.active_min:.1f} min, Drive {vehicle_solution.drive_min:.1f} min, "
+            f"Service {vehicle_solution.service_min:.1f} min, Billed {vehicle_solution.billed_hours} h"
+        )
+        if vehicle_solution.lunch_break_start_min is not None:
+            lunch_end = vehicle_solution.lunch_break_start_min + MIDDAY_LUNCH_BREAK_RULE.duration_min
+            lines.append(
+                "  "
+                f"Lunch break {minutes_to_clock(vehicle_solution.lunch_break_start_min)}-"
+                f"{minutes_to_clock(lunch_end)}"
+            )
+        lines.append(
+            "  "
+            f"Distance cost {vehicle_solution.distance_cost:.2f}, "
+            f"Route cost {vehicle_solution.route_cost:.2f}"
+        )
+        lines.append(f"  Route IDs: {format_route_stop_ids(vehicle_solution.route)}")
+        lines.append(
+            "  Route detail: "
+            f"{format_route_stop_details(instance, vehicle_solution.route)}"
+        )
+        for stop_id in vehicle_solution.route:
+            if stop_id == DEPOT_NODE:
+                continue
+            lines.append(
+                "    "
+                f"{format_stop_detail_label(instance.stops[stop_id])}: "
+                f"start {minutes_to_clock(vehicle_solution.service_start_min[stop_id])}, "
+                f"late {vehicle_solution.late_min[stop_id]:.1f} min"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_branch_and_price_route_report(
+    instance: Instance,
+    *,
+    status: str,
+    objective: float | None,
+    best_bound: float | None,
+    gap: float | None,
+    selected_routes: list[RouteColumn],
+    vehicle_types: dict[str, VehicleTypeData],
+    nodes_processed: int | None = None,
+    nodes_pruned: int | None = None,
+    root_lp_objective: float | None = None,
+    global_columns: int | None = None,
+) -> str:
+    lines = [
+        f"Status: {status}",
+        "Formulation: Branch-and-Price Set Partitioning",
+    ]
+    if global_columns is not None:
+        lines.append(f"Columns generated: {global_columns}")
+    if nodes_processed is not None:
+        lines.append(f"Nodes processed: {nodes_processed}")
+    if nodes_pruned is not None:
+        lines.append(f"Nodes pruned: {nodes_pruned}")
+    if root_lp_objective is not None:
+        lines.append(f"Root LP objective: {root_lp_objective:.2f}")
+    if best_bound is not None:
+        lines.append(f"Best bound: {best_bound:.2f}")
+    if objective is not None:
+        lines.append(f"Objective value: {objective:.2f}")
+    if gap is not None:
+        lines.append(f"Relative gap: {100.0 * gap:.2f}%")
+    lines.append("")
+
+    if not selected_routes:
+        lines.append("No feasible incumbent route set found.")
+        return "\n".join(lines) + "\n"
+
+    usage_counter: dict[str, int] = defaultdict(int)
+    for route in sorted(
+        selected_routes,
+        key=lambda candidate: (candidate.type_id, candidate.return_min, candidate.stop_sequence),
+    ):
+        vehicle_type = vehicle_types[route.type_id]
+        usage_counter[route.type_id] += 1
+        vehicle_position = usage_counter[route.type_id] - 1
+        vehicle_id = vehicle_type.vehicle_ids[vehicle_position]
+
+        lines.append(f"Vehicle {vehicle_id} ({vehicle_type.vehicle_type})")
+        lines.append(
+            "  "
+            f"Depart {minutes_to_clock(vehicle_start_limit(instance, vehicle_type))}, "
+            f"Return {minutes_to_clock(route.return_min)}, "
+            f"Load {route.load_kg:.0f} / {vehicle_type.capacity_kg:.0f} kg"
+        )
+        lines.append(
+            "  "
+            f"Active {route.active_min:.1f} min, Distance {route.distance_mi:.2f} mi, "
+            f"Route cost {route.cost:.2f}"
+        )
+        if route.lunch_break_start_min is not None:
+            lunch_end = route.lunch_break_start_min + MIDDAY_LUNCH_BREAK_RULE.duration_min
+            lines.append(
+                "  "
+                f"Lunch break {minutes_to_clock(route.lunch_break_start_min)}-"
+                f"{minutes_to_clock(lunch_end)}"
+            )
+        route_with_depot = (DEPOT_NODE,) + route.stop_sequence + (DEPOT_NODE,)
+        lines.append(f"  Route IDs: {format_route_stop_ids(route_with_depot)}")
+        lines.append(
+            "  Route detail: "
+            f"{format_route_stop_details(instance, route_with_depot)}"
+        )
+        for stop_id in route.stop_sequence:
+            start = route.service_start_min[stop_id]
+            early = max(instance.stops[stop_id].earliest_min - start, 0.0)
+            late = route.late_min[stop_id]
+            lines.append(
+                "    "
+                f"{format_stop_detail_label(instance.stops[stop_id])}: "
+                f"start {minutes_to_clock(start)}, "
+                f"early {early:.1f} min, late {late:.1f} min"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def save_route_based_interrupt_incumbent_report(
+    workbook_path: Path,
+    checkpoint_path: Path | None,
+) -> Path | None:
+    if checkpoint_path is None or not checkpoint_path.is_file():
+        return None
+
+    try:
+        instance = load_instance(workbook_path)
+        vehicle_types = build_vehicle_types(instance)
+        checkpoint_state = load_branch_and_price_checkpoint(
+            checkpoint_path,
+            workbook_path=workbook_path,
+            instance=instance,
+            vehicle_types=vehicle_types,
+        )
+    except Exception:
+        return None
+
+    if not checkpoint_state.incumbent_routes:
+        return None
+
+    report_path = default_interrupt_incumbent_report_path(workbook_path)
+    report_text = render_branch_and_price_route_report(
+        instance,
+        status="INTERRUPTED",
+        objective=checkpoint_state.incumbent_obj,
+        best_bound=None,
+        gap=None,
+        selected_routes=checkpoint_state.incumbent_routes,
+        vehicle_types=vehicle_types,
+        nodes_processed=checkpoint_state.nodes_processed,
+        nodes_pruned=checkpoint_state.nodes_pruned,
+        root_lp_objective=checkpoint_state.root_lp_objective,
+        global_columns=len(checkpoint_state.route_pool),
+    )
+    return write_text_report(report_path, report_text)
+
+
 def solve_arc_flow_model(
     workbook_path: Path,
     time_limit: float | None,
@@ -2935,9 +3220,26 @@ def solve_arc_flow_model(
                     gap=interrupted_gap,
                     note="Arc-flow MIP interrupted",
                 )
+            if model.SolCount > 0:
+                interrupted_vehicle_solutions = extract_arc_flow_vehicle_solutions(instance, data)
+                interrupted_report_path = write_text_report(
+                    default_interrupt_incumbent_report_path(workbook_path),
+                    render_arc_flow_vehicle_solution_report(
+                        instance,
+                        interrupted_vehicle_solutions,
+                        status="INTERRUPTED",
+                        objective=interrupted_objective,
+                        best_bound=interrupted_best_bound,
+                        gap=interrupted_gap,
+                    ),
+                )
+                record_interrupt_artifact("interrupt_incumbent_report", interrupted_report_path)
+                print(f"Saved interrupt incumbent route report to {interrupted_report_path}")
             if saved_bound_plot_path is not None:
+                record_interrupt_artifact("partial_mip_bound_plot", saved_bound_plot_path)
                 print(f"\nPartial MIP bound plot saved to {saved_bound_plot_path}")
             if resume_solution_path is not None:
+                record_interrupt_artifact("resumable_mip_start", resume_solution_path)
                 print(f"Saved resumable MIP start to {resume_solution_path}")
             raise
 
@@ -2952,50 +3254,9 @@ def solve_arc_flow_model(
         objective = model.ObjVal if model.SolCount > 0 else None
         gap = relative_gap(objective, best_bound)
 
-        vehicle_solutions: list[ArcFlowVehicleSolution] = []
-        if model.SolCount > 0:
-            for vehicle_id in data["vehicle_ids"]:
-                if data["use_vehicle"][vehicle_id].X < 0.5:
-                    continue
-                vehicle = instance.vehicles[vehicle_id]
-                route = extract_arc_flow_route(data, vehicle_id)
-                served_stops = [stop_id for stop_id in route if stop_id != DEPOT_NODE]
-                service_start_min = {
-                    stop_id: data["service_start_min"][stop_id].X for stop_id in served_stops
-                }
-                late_min = {stop_id: data["late_min"][stop_id].X for stop_id in served_stops}
-                lunch_break_start_min = (
-                    data["lunch_start_min"][vehicle_id].X
-                    if data["lunch_required"][vehicle_id].X > 0.5
-                    else None
-                )
-                distance_cost = data["distance_cost_expr"][vehicle_id].getValue()
-                billed_hours = int(round(data["billed_hours"][vehicle_id].X))
-                route_cost = (
-                    vehicle.fixed_daily_cost
-                    + distance_cost
-                    + billed_hours * instance.cost_params["Driver_Hourly_Wage"]
-                    + sum(late_min.values()) / 60.0 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
-                )
-                vehicle_solutions.append(
-                    ArcFlowVehicleSolution(
-                        vehicle_id=vehicle_id,
-                        vehicle=vehicle,
-                        route=route,
-                        load_kg=sum(instance.stops[stop_id].demand_kg for stop_id in served_stops),
-                        depart_min=data["depart_min"][vehicle_id].X,
-                        return_min=data["return_min"][vehicle_id].X,
-                        drive_min=data["drive_min_expr"][vehicle_id].getValue(),
-                        service_min=data["service_min_expr"][vehicle_id].getValue(),
-                        active_min=data["active_min_expr"][vehicle_id].getValue(),
-                        billed_hours=billed_hours,
-                        distance_cost=distance_cost,
-                        route_cost=route_cost,
-                        service_start_min=service_start_min,
-                        late_min=late_min,
-                        lunch_break_start_min=lunch_break_start_min,
-                    )
-                )
+        vehicle_solutions = (
+            extract_arc_flow_vehicle_solutions(instance, data) if model.SolCount > 0 else []
+        )
 
         saved_bound_plot_path = bound_logger.save_plot(f"{workbook_path.stem} MIP Bounds ({status})")
         result = ArcFlowSolveResult(
@@ -3107,6 +3368,7 @@ def solve_arc_flow_model(
                 status_label=("INTERRUPTED" if isinstance(exc, KeyboardInterrupt) else "ABORTED"),
             )
             if saved_bound_plot_path is not None and isinstance(exc, KeyboardInterrupt):
+                record_interrupt_artifact("partial_mip_bound_plot", saved_bound_plot_path)
                 print(f"\nPartial MIP bound plot saved to {saved_bound_plot_path}")
         raise
 
@@ -5737,6 +5999,15 @@ def parse_args() -> argparse.Namespace:
         help="Disable writing the objective trace CSV.",
     )
     parser.add_argument(
+        "--interrupt-report-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional text file path to write interrupt artifact locations to when the run is "
+            "stopped with Ctrl-C/SIGTERM. Default: auto-generate beside the workbook."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-path",
         type=Path,
         default=None,
@@ -5762,6 +6033,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     global _INTERRUPT_SIGNAL_NAME
     _INTERRUPT_SIGNAL_NAME = None
+    _LATEST_INTERRUPT_ARTIFACTS.clear()
     args = parse_args()
     route_based_enabled = args.route_based
     selected_mip_profile: ArcFlowMIPProfile | None = None
@@ -5822,6 +6094,9 @@ def main() -> None:
         if args.no_objective_trace
         else (args.objective_trace or default_objective_trace_path(args.workbook))
     )
+    interrupt_report_path = (
+        args.interrupt_report_path or default_interrupt_artifact_report_path(args.workbook)
+    )
     checkpoint_path = (args.checkpoint_path or args.resume_from) if route_based_enabled else None
     checkpoint_manager = CheckpointManager(checkpoint_path)
     mip_persistence_manager = (
@@ -5838,6 +6113,7 @@ def main() -> None:
 
     try:
         if trace_logger.path is not None:
+            record_interrupt_artifact("objective_trace", trace_logger.path)
             print(f"Objective trace: {trace_logger.path}")
             trace_logger.record(
                 event="run_start",
@@ -5845,6 +6121,7 @@ def main() -> None:
                 note=f"Workbook: {args.workbook}",
             )
         if checkpoint_manager.path is not None:
+            record_interrupt_artifact("checkpoint", checkpoint_manager.path)
             print(f"Checkpoint path: {checkpoint_manager.path}")
         if configured_wls_license is not None:
             print("Using Gurobi WLS credentials from .env, environment variables, or fallback script settings.")
@@ -5895,6 +6172,29 @@ def main() -> None:
             print(f"\n{interrupt_note}. Partial objective trace saved to {trace_logger.path}")
         if checkpoint_manager.path is not None:
             print(f"{interrupt_note}. Latest checkpoint retained at {checkpoint_manager.path}")
+        if route_based_enabled:
+            interrupt_incumbent_report_path = save_route_based_interrupt_incumbent_report(
+                args.workbook,
+                checkpoint_manager.path,
+            )
+            if interrupt_incumbent_report_path is not None:
+                record_interrupt_artifact(
+                    "interrupt_incumbent_report",
+                    interrupt_incumbent_report_path,
+                )
+                print(
+                    f"{interrupt_note}. Saved interrupt incumbent route report to "
+                    f"{interrupt_incumbent_report_path}"
+                )
+        saved_interrupt_report_path = write_interrupt_artifact_report(
+            interrupt_report_path,
+            workbook_path=args.workbook,
+            interrupt_note=interrupt_note,
+        )
+        print(
+            f"{interrupt_note}. Interrupt artifact report saved to "
+            f"{saved_interrupt_report_path}"
+        )
         raise SystemExit(130) from None
     finally:
         dispose_gurobi_env()
