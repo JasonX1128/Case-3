@@ -31,6 +31,7 @@ INITIAL_ACTIVE_COVER_CANDIDATES_PER_STOP = 3
 INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE = 12
 INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
 DEFAULT_MIP_FORMULATION_VERSION = 3
+DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
 
 # ============================================================================
 # Hardcoded business rules
@@ -94,6 +95,92 @@ REQUIRED_ADJACENT_STOP_PARTNER: dict[int, int] = {
     for stop_id, partner_id in ((rule.stop_a, rule.stop_b), (rule.stop_b, rule.stop_a))
 }
 REQUIRED_SAME_ROUTE_PAIRS = frozenset(rule.ordered_pair for rule in REDSTONE_PLAZA_PAIR_RULES)
+
+
+@dataclass(frozen=True)
+class ArcFlowMIPProfile:
+    name: str
+    description: str
+    params: dict[str, float | int | str]
+
+
+def load_arc_flow_mip_profiles(
+    profile_path: Path = DEFAULT_MIP_PROFILE_PATH,
+) -> dict[str, ArcFlowMIPProfile]:
+    """Load named arc-flow tuning profiles from a repo-local JSON file."""
+
+    try:
+        raw_profiles = json.loads(profile_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Arc-flow MIP profile file not found: {profile_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Arc-flow MIP profile file is not valid JSON: {profile_path}") from exc
+
+    if not isinstance(raw_profiles, dict):
+        raise ValueError(
+            f"Arc-flow MIP profile file must contain a JSON object at the top level: {profile_path}"
+        )
+
+    profiles: dict[str, ArcFlowMIPProfile] = {}
+    for profile_name, payload in raw_profiles.items():
+        if not isinstance(profile_name, str) or not profile_name:
+            raise ValueError(f"Arc-flow MIP profile names must be non-empty strings: {profile_path}")
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Arc-flow MIP profile '{profile_name}' must map to an object in {profile_path}"
+            )
+
+        description = payload.get("description")
+        params = payload.get("params")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(
+                f"Arc-flow MIP profile '{profile_name}' needs a non-empty description in {profile_path}"
+            )
+        if not isinstance(params, dict) or not params:
+            raise ValueError(
+                f"Arc-flow MIP profile '{profile_name}' needs a non-empty params object in {profile_path}"
+            )
+
+        normalized_params: dict[str, float | int | str] = {}
+        for param_name, param_value in params.items():
+            if not isinstance(param_name, str) or not param_name:
+                raise ValueError(
+                    f"Arc-flow MIP profile '{profile_name}' contains an invalid parameter name"
+                )
+            if not isinstance(param_value, (int, float, str)):
+                raise ValueError(
+                    f"Arc-flow MIP profile '{profile_name}' uses an unsupported value for "
+                    f"parameter '{param_name}'"
+                )
+            normalized_params[param_name] = param_value
+
+        profiles[profile_name] = ArcFlowMIPProfile(
+            name=profile_name,
+            description=description.strip(),
+            params=normalized_params,
+        )
+
+    return profiles
+
+
+def apply_arc_flow_mip_profile(
+    model: gp.Model,
+    profile: ArcFlowMIPProfile,
+    *,
+    skip_params: frozenset[str] = frozenset(),
+) -> None:
+    """Apply one named tuning profile to the default arc-flow MIP model."""
+
+    for param_name, param_value in profile.params.items():
+        if param_name in skip_params:
+            continue
+        try:
+            model.setParam(param_name, param_value)
+        except (AttributeError, TypeError, gp.GurobiError) as exc:
+            raise ValueError(
+                f"Arc-flow MIP profile '{profile.name}' contains unsupported Gurobi parameter "
+                f"'{param_name}'"
+            ) from exc
 
 # Optional fallback WLS credentials for hosted environments like Google Colab.
 # Prefer storing secrets in a .env file beside this script:
@@ -2619,6 +2706,8 @@ def solve_arc_flow_model(
     workbook_path: Path,
     time_limit: float | None,
     mip_gap: float | None,
+    mip_profile: ArcFlowMIPProfile | None = None,
+    skip_mip_profile_params: frozenset[str] = frozenset(),
     progress: ProgressTracker | None = None,
     trace_logger: ObjectiveTraceLogger | None = None,
     persistence_manager: MIPPersistenceManager | None = None,
@@ -2630,6 +2719,10 @@ def solve_arc_flow_model(
     model, data = build_arc_flow_model(instance)
     loaded_start_path: Path | None = None
 
+    if mip_profile is not None:
+        print(f"Arc-flow MIP profile: {mip_profile.name}")
+        print(f"  {mip_profile.description}")
+        apply_arc_flow_mip_profile(model, mip_profile, skip_params=skip_mip_profile_params)
     if time_limit is not None:
         model.Params.TimeLimit = time_limit
     if mip_gap is not None:
@@ -5324,6 +5417,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional relative MIP/optimality gap target for the active solver.",
     )
     parser.add_argument(
+        "--mip-profile",
+        type=str,
+        default=None,
+        help=(
+            "Optional named Gurobi tuning profile for the default arc-flow MIP. "
+            "Built-in profiles are stored in gurobi_mip_profiles.json: "
+            "hybrid, two-minute, max-accuracy. Only used without --route-based."
+        ),
+    )
+    parser.add_argument(
         "--mip-persist-dir",
         type=Path,
         default=None,
@@ -5467,6 +5570,7 @@ def main() -> None:
     _INTERRUPT_SIGNAL_NAME = None
     args = parse_args()
     route_based_enabled = args.route_based
+    selected_mip_profile: ArcFlowMIPProfile | None = None
     route_based_only_overrides: list[str] = []
     if not route_based_enabled:
         if args.max_cg_iterations != 200:
@@ -5492,6 +5596,20 @@ def main() -> None:
         raise SystemExit(f"{override_list} requires --route-based.")
     if route_based_enabled and args.mip_persist_dir is not None:
         raise SystemExit("--mip-persist-dir is only supported for the default arc-flow MIP path.")
+    if route_based_enabled and args.mip_profile is not None:
+        raise SystemExit("--mip-profile is only supported for the default arc-flow MIP path.")
+    if args.mip_profile is not None:
+        try:
+            mip_profiles = load_arc_flow_mip_profiles()
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        selected_mip_profile = mip_profiles.get(args.mip_profile)
+        if selected_mip_profile is None:
+            available_profiles = ", ".join(sorted(mip_profiles))
+            raise SystemExit(
+                f"Unknown arc-flow MIP profile '{args.mip_profile}'. "
+                f"Available profiles: {available_profiles}."
+            )
     heuristic_time_limit = HEURISTIC_MASTER_TIME_LIMIT
     if args.unlimited:
         args.time_limit = None
@@ -5562,6 +5680,10 @@ def main() -> None:
                 workbook_path=args.workbook,
                 time_limit=args.time_limit,
                 mip_gap=args.mip_gap,
+                mip_profile=selected_mip_profile,
+                skip_mip_profile_params=(
+                    frozenset({"TimeLimit", "MIPGap"}) if args.unlimited else frozenset()
+                ),
                 progress=progress,
                 trace_logger=trace_logger,
                 persistence_manager=mip_persistence_manager,

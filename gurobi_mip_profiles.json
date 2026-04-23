@@ -1,0 +1,41 @@
+{
+  "hybrid": {
+    "description": "Balanced incumbent-focused profile for the default arc-flow MIP. This is the best first profile to try when you want faster practical answers without going fully short-horizon.",
+    "params": {
+      "MIPFocus": 1,
+      "Heuristics": 0.15,
+      "Cuts": 1,
+      "Symmetry": 2,
+      "Presolve": 2,
+      "Threads": 4,
+      "NodefileStart": 0.5
+    }
+  },
+  "two-minute": {
+    "description": "Short-budget incumbent-hunting profile for the default arc-flow MIP. It targets about a two-minute run unless you override the time limit on the command line.",
+    "params": {
+      "TimeLimit": 120,
+      "MIPFocus": 1,
+      "Heuristics": 0.3,
+      "NoRelHeurTime": 20,
+      "Cuts": 1,
+      "Symmetry": 2,
+      "Presolve": 2,
+      "Threads": 4,
+      "NodefileStart": 0.5
+    }
+  },
+  "max-accuracy": {
+    "description": "Long-run proof-quality profile for the default arc-flow MIP. Use this when you care more about bound movement and eventual optimality than about a quick incumbent.",
+    "params": {
+      "MIPFocus": 3,
+      "Heuristics": 0.05,
+      "Cuts": 2,
+      "Symmetry": 2,
+      "Presolve": 2,
+      "IntegralityFocus": 1,
+      "Threads": 4,
+      "NodefileStart": 0.5
+    }
+  }
+}
