@@ -30,9 +30,23 @@ INITIAL_ACTIVE_COVER_CANDIDATES_PER_STOP = 3
 INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE = 12
 INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
 
+# Optional fallback WLS credentials for hosted environments like Google Colab.
+# Prefer storing secrets in a .env file beside this script:
+#   GUROBI_WLSACCESSID=...
+#   GUROBI_WLSSECRET=...
+#   GUROBI_LICENSEID=...
+# Environment variables override .env, and these hardcoded values are used
+# only as a final fallback. Leave them blank to avoid storing secrets here.
+GUROBI_WLS_LICENSE: dict[str, str] = {
+    "WLSACCESSID": "",
+    "WLSSECRET": "",
+    "LICENSEID": "",
+}
+
 _PRICING_WORKER_INSTANCE: Instance | None = None
 _PRICING_WORKER_BRANCH_CTX: BranchContext | None = None
 _INTERRUPT_SIGNAL_NAME: str | None = None
+_GUROBI_ENV: gp.Env | None = None
 _MISSING = object()
 
 
@@ -152,6 +166,35 @@ class BranchAndPriceResult:
     nodes_pruned: int
     global_columns: int
     root_lp_objective: float | None
+
+
+@dataclass
+class ArcFlowVehicleSolution:
+    vehicle_id: int
+    vehicle: VehicleData
+    route: tuple[int, ...]
+    load_kg: float
+    depart_min: float
+    return_min: float
+    drive_min: float
+    service_min: float
+    active_min: float
+    billed_hours: int
+    distance_cost: float
+    route_cost: float
+    service_start_min: dict[int, float]
+    late_min: dict[int, float]
+
+
+@dataclass
+class ArcFlowSolveResult:
+    status: str
+    objective: float | None
+    best_bound: float | None
+    gap: float | None
+    vehicle_solutions: list[ArcFlowVehicleSolution]
+    fixed_arc_count: int
+    symmetry_group_count: int
 
 
 @dataclass
@@ -326,6 +369,142 @@ class ObjectiveTraceLogger:
         self._file.close()
         self._file = None
         self._writer = None
+
+
+def candidate_dotenv_paths() -> list[Path]:
+    paths = [Path(__file__).resolve().with_name(".env"), Path.cwd() / ".env"]
+    unique_paths: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_paths.append(resolved)
+    return unique_paths
+
+
+def parse_dotenv_line(raw_line: str) -> tuple[str, str] | None:
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[len("export ") :].strip()
+    if "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        return None
+    if value and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return key, value
+
+
+def load_dotenv_file() -> dict[str, str]:
+    for path in candidate_dotenv_paths():
+        if not path.is_file():
+            continue
+        values: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            parsed = parse_dotenv_line(line)
+            if parsed is None:
+                continue
+            key, value = parsed
+            values[key] = value
+        return values
+    return {}
+
+
+def get_license_setting(
+    *,
+    dotenv_values: dict[str, str],
+    env_key: str,
+    legacy_env_key: str,
+    fallback: str,
+) -> str:
+    if env_key in os.environ:
+        return os.environ[env_key].strip()
+    if legacy_env_key in os.environ:
+        return os.environ[legacy_env_key].strip()
+    if env_key in dotenv_values:
+        return dotenv_values[env_key].strip()
+    if legacy_env_key in dotenv_values:
+        return dotenv_values[legacy_env_key].strip()
+    return fallback.strip()
+
+
+def resolve_gurobi_wls_license() -> dict[str, str | int] | None:
+    dotenv_values = load_dotenv_file()
+
+    access_id = get_license_setting(
+        dotenv_values=dotenv_values,
+        env_key="GUROBI_WLSACCESSID",
+        legacy_env_key="WLSACCESSID",
+        fallback=GUROBI_WLS_LICENSE["WLSACCESSID"],
+    )
+    secret = get_license_setting(
+        dotenv_values=dotenv_values,
+        env_key="GUROBI_WLSSECRET",
+        legacy_env_key="WLSSECRET",
+        fallback=GUROBI_WLS_LICENSE["WLSSECRET"],
+    )
+    license_id_text = get_license_setting(
+        dotenv_values=dotenv_values,
+        env_key="GUROBI_LICENSEID",
+        legacy_env_key="LICENSEID",
+        fallback=GUROBI_WLS_LICENSE["LICENSEID"],
+    )
+
+    configured_fields = [bool(access_id), bool(secret), bool(license_id_text)]
+    if not any(configured_fields):
+        return None
+    if not all(configured_fields):
+        raise ValueError(
+            "Incomplete Gurobi WLS configuration. Set GUROBI_WLSACCESSID, "
+            "GUROBI_WLSSECRET, and GUROBI_LICENSEID in a .env file beside "
+            "vrp_gurobi.py, in environment variables, or in GUROBI_WLS_LICENSE."
+        )
+
+    try:
+        license_id = int(license_id_text)
+    except ValueError as exc:
+        raise ValueError("GUROBI_LICENSEID must be an integer.") from exc
+
+    return {
+        "WLSACCESSID": access_id,
+        "WLSSECRET": secret,
+        "LICENSEID": license_id,
+    }
+
+
+def get_gurobi_env() -> gp.Env | None:
+    global _GUROBI_ENV
+    if _GUROBI_ENV is not None:
+        return _GUROBI_ENV
+
+    options = resolve_gurobi_wls_license()
+    if options is None:
+        return None
+
+    _GUROBI_ENV = gp.Env(params=options)
+    return _GUROBI_ENV
+
+
+def dispose_gurobi_env() -> None:
+    global _GUROBI_ENV
+    if _GUROBI_ENV is None:
+        return
+    _GUROBI_ENV.dispose()
+    _GUROBI_ENV = None
+
+
+def create_gurobi_model(name: str) -> gp.Model:
+    env = get_gurobi_env()
+    if env is None:
+        return gp.Model(name)
+    return gp.Model(name, env=env)
 
 
 def serialize_route_ref(route: RouteColumn) -> dict[str, Any]:
@@ -802,6 +981,27 @@ def relative_gap(incumbent: float | None, best_bound: float | None) -> float | N
     return max(incumbent - best_bound, 0.0) / abs(incumbent)
 
 
+def gurobi_status_name(status: int) -> str:
+    names = {
+        GRB.OPTIMAL: "OPTIMAL",
+        GRB.INFEASIBLE: "INFEASIBLE",
+        GRB.INF_OR_UNBD: "INF_OR_UNBD",
+        GRB.UNBOUNDED: "UNBOUNDED",
+        GRB.CUTOFF: "CUTOFF",
+        GRB.ITERATION_LIMIT: "ITERATION_LIMIT",
+        GRB.NODE_LIMIT: "NODE_LIMIT",
+        GRB.TIME_LIMIT: "TIME_LIMIT",
+        GRB.SOLUTION_LIMIT: "SOLUTION_LIMIT",
+        GRB.INTERRUPTED: "INTERRUPTED",
+        GRB.NUMERIC: "NUMERIC",
+        GRB.SUBOPTIMAL: "SUBOPTIMAL",
+        GRB.USER_OBJ_LIMIT: "USER_OBJ_LIMIT",
+        GRB.WORK_LIMIT: "WORK_LIMIT",
+        GRB.MEM_LIMIT: "MEM_LIMIT",
+    }
+    return names.get(status, str(status))
+
+
 def stabilize_dual_vector(
     raw_duals: dict[Any, float],
     previous_duals: dict[Any, float] | None,
@@ -1075,11 +1275,11 @@ def load_instance(workbook_path: Path) -> Instance:
     )
 
 
-def validate_route_based_assumptions(instance: Instance) -> None:
+def validate_shared_cost_assumptions(instance: Instance) -> None:
     early_penalty = instance.cost_params.get("Early_Delivery_Penalty", 0.0)
     if abs(early_penalty) > 1e-9:
         raise NotImplementedError(
-            "This branch-and-price model currently assumes zero early-delivery penalty. "
+            "This solver currently assumes zero early-delivery penalty. "
             "That matches the workbook scenario, where Early_Delivery_Penalty = 0."
         )
 
@@ -1220,6 +1420,532 @@ def evaluate_route_sequence(
         service_start_min=service_start_min,
         late_min=late_min,
     )
+
+
+def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
+    validate_shared_cost_assumptions(instance)
+
+    model = create_gurobi_model("arc_flow_vrp")
+
+    stop_ids = sorted(instance.stops)
+    vehicle_ids = sorted(instance.vehicles)
+    node_ids = [DEPOT_NODE] + stop_ids
+    node_pairs = [(i, j) for i in node_ids for j in node_ids if i != j]
+    arc_keys = [(v, i, j) for v in vehicle_ids for i, j in node_pairs]
+    identical_vehicle_groups: dict[tuple[Any, ...], list[int]] = {}
+    for vehicle_id in vehicle_ids:
+        vehicle = instance.vehicles[vehicle_id]
+        key = (
+            vehicle.vehicle_type,
+            vehicle.capacity_kg,
+            vehicle.cost_per_mile,
+            vehicle.fixed_daily_cost,
+            vehicle.available_from_min,
+            vehicle.available_until_min,
+        )
+        identical_vehicle_groups.setdefault(key, []).append(vehicle_id)
+
+    start_limit = {
+        vehicle_id: max(instance.vehicles[vehicle_id].available_from_min, instance.depot_open_min)
+        for vehicle_id in vehicle_ids
+    }
+    end_limit = {
+        vehicle_id: min(instance.vehicles[vehicle_id].available_until_min, instance.depot_close_min)
+        for vehicle_id in vehicle_ids
+    }
+    route_horizon = {
+        vehicle_id: max(end_limit[vehicle_id] - start_limit[vehicle_id], 0.0)
+        for vehicle_id in vehicle_ids
+    }
+    max_time_bound = max(end_limit.values(), default=0.0)
+
+    vehicle_stop_lb: dict[tuple[int, int], float] = {}
+    vehicle_stop_ub: dict[tuple[int, int], float] = {}
+    feasible_vehicle_stop: dict[tuple[int, int], bool] = {}
+    min_round_trip: dict[int, float] = {}
+
+    for vehicle_id in vehicle_ids:
+        vehicle = instance.vehicles[vehicle_id]
+        feasible_round_trips: list[float] = []
+        for stop_id in stop_ids:
+            stop = instance.stops[stop_id]
+            lb = start_limit[vehicle_id] + instance.travel_minutes[DEPOT_NODE, stop_id]
+            ub = end_limit[vehicle_id] - stop.service_min - instance.travel_minutes[stop_id, DEPOT_NODE]
+            feasible = stop.demand_kg <= vehicle.capacity_kg + 1e-9 and lb <= ub + 1e-9
+            vehicle_stop_lb[vehicle_id, stop_id] = lb
+            vehicle_stop_ub[vehicle_id, stop_id] = ub
+            feasible_vehicle_stop[vehicle_id, stop_id] = feasible
+            if feasible:
+                feasible_round_trips.append(
+                    instance.travel_minutes[DEPOT_NODE, stop_id]
+                    + stop.service_min
+                    + instance.travel_minutes[stop_id, DEPOT_NODE]
+                )
+        min_round_trip[vehicle_id] = min(feasible_round_trips) if feasible_round_trips else 0.0
+
+    service_start_lb: dict[int, float] = {}
+    service_start_ub: dict[int, float] = {}
+    late_ub: dict[int, float] = {}
+    for stop_id in stop_ids:
+        feasible_vehicles = [
+            vehicle_id for vehicle_id in vehicle_ids if feasible_vehicle_stop[vehicle_id, stop_id]
+        ]
+        if not feasible_vehicles:
+            raise ValueError(
+                f"Stop {stop_id} cannot be served by any vehicle under the workbook data."
+            )
+        service_start_lb[stop_id] = min(
+            vehicle_stop_lb[vehicle_id, stop_id] for vehicle_id in feasible_vehicles
+        )
+        service_start_ub[stop_id] = max(
+            vehicle_stop_ub[vehicle_id, stop_id] for vehicle_id in feasible_vehicles
+        )
+        late_ub[stop_id] = max(
+            service_start_ub[stop_id] - instance.stops[stop_id].latest_min,
+            0.0,
+        )
+
+    feasible_arc: dict[tuple[int, int, int], bool] = {}
+    start_arc_m: dict[tuple[int, int], float] = {}
+    end_arc_m: dict[tuple[int, int], float] = {}
+    stop_arc_m: dict[tuple[int, int, int], float] = {}
+
+    for vehicle_id in vehicle_ids:
+        for stop_id in stop_ids:
+            stop = instance.stops[stop_id]
+            can_serve = feasible_vehicle_stop[vehicle_id, stop_id]
+            feasible_arc[vehicle_id, DEPOT_NODE, stop_id] = can_serve
+            feasible_arc[vehicle_id, stop_id, DEPOT_NODE] = can_serve
+            start_arc_m[vehicle_id, stop_id] = max(
+                end_limit[vehicle_id]
+                - service_start_lb[stop_id]
+                + instance.travel_minutes[DEPOT_NODE, stop_id],
+                0.0,
+            )
+            end_arc_m[vehicle_id, stop_id] = max(
+                stop.service_min
+                + instance.travel_minutes[stop_id, DEPOT_NODE]
+                + service_start_ub[stop_id],
+                0.0,
+            )
+            for next_stop in stop_ids:
+                if stop_id == next_stop:
+                    continue
+                if not can_serve or not feasible_vehicle_stop[vehicle_id, next_stop]:
+                    feasible_arc[vehicle_id, stop_id, next_stop] = False
+                    continue
+                feasible_arc[vehicle_id, stop_id, next_stop] = (
+                    vehicle_stop_lb[vehicle_id, stop_id]
+                    + stop.service_min
+                    + instance.travel_minutes[stop_id, next_stop]
+                    <= vehicle_stop_ub[vehicle_id, next_stop] + 1e-9
+                )
+                stop_arc_m[vehicle_id, stop_id, next_stop] = max(
+                    stop.service_min
+                    + instance.travel_minutes[stop_id, next_stop]
+                    + service_start_ub[stop_id]
+                    - service_start_lb[next_stop],
+                    0.0,
+                )
+
+    x = model.addVars(arc_keys, vtype=GRB.BINARY, name="x")
+    use_vehicle = model.addVars(vehicle_ids, vtype=GRB.BINARY, name="use_vehicle")
+    depart_min = model.addVars(vehicle_ids, lb=0.0, ub=max_time_bound, name="depart_min")
+    return_min = model.addVars(vehicle_ids, lb=0.0, ub=max_time_bound, name="return_min")
+    service_start_min = model.addVars(
+        stop_ids,
+        lb=service_start_lb,
+        ub=service_start_ub,
+        name="service_start_min",
+    )
+    late_min = model.addVars(stop_ids, lb=0.0, ub=late_ub, name="late_min")
+    billed_hours = model.addVars(
+        vehicle_ids,
+        lb=0.0,
+        ub={vehicle_id: billed_operating_hours(route_horizon[vehicle_id]) for vehicle_id in vehicle_ids},
+        vtype=GRB.INTEGER,
+        name="billed_hours",
+    )
+
+    fixed_arc_count = 0
+    for vehicle_id, i, j in arc_keys:
+        if not feasible_arc.get((vehicle_id, i, j), False):
+            x[vehicle_id, i, j].ub = 0.0
+            fixed_arc_count += 1
+
+    incoming = {
+        (vehicle_id, stop_id): gp.quicksum(
+            x[vehicle_id, i, stop_id] for i in node_ids if i != stop_id
+        )
+        for vehicle_id in vehicle_ids
+        for stop_id in stop_ids
+    }
+    outgoing = {
+        (vehicle_id, stop_id): gp.quicksum(
+            x[vehicle_id, stop_id, j] for j in node_ids if j != stop_id
+        )
+        for vehicle_id in vehicle_ids
+        for stop_id in stop_ids
+    }
+    starts = {
+        vehicle_id: gp.quicksum(x[vehicle_id, DEPOT_NODE, stop_id] for stop_id in stop_ids)
+        for vehicle_id in vehicle_ids
+    }
+    returns = {
+        vehicle_id: gp.quicksum(x[vehicle_id, stop_id, DEPOT_NODE] for stop_id in stop_ids)
+        for vehicle_id in vehicle_ids
+    }
+    first_customer_index_expr = {
+        vehicle_id: gp.quicksum(
+            stop_id * x[vehicle_id, DEPOT_NODE, stop_id] for stop_id in stop_ids
+        )
+        for vehicle_id in vehicle_ids
+    }
+    drive_min_expr = {
+        vehicle_id: gp.quicksum(
+            instance.travel_minutes[i, j] * x[vehicle_id, i, j]
+            for i, j in node_pairs
+        )
+        for vehicle_id in vehicle_ids
+    }
+    service_min_expr = {
+        vehicle_id: gp.quicksum(
+            instance.stops[stop_id].service_min * incoming[vehicle_id, stop_id]
+            for stop_id in stop_ids
+        )
+        for vehicle_id in vehicle_ids
+    }
+    active_min_expr = {
+        vehicle_id: return_min[vehicle_id] - depart_min[vehicle_id] for vehicle_id in vehicle_ids
+    }
+    distance_cost_expr = {
+        vehicle_id: gp.quicksum(
+            instance.distance_miles[i, j]
+            * (
+                instance.vehicles[vehicle_id].cost_per_mile
+                + instance.cost_params["Fuel_Cost_per_Liter"]
+                * instance.cost_params["Avg_Fuel_Consumption_L_per_mile"]
+            )
+            * x[vehicle_id, i, j]
+            for i, j in node_pairs
+        )
+        for vehicle_id in vehicle_ids
+    }
+
+    for stop_id in stop_ids:
+        model.addConstr(
+            gp.quicksum(incoming[vehicle_id, stop_id] for vehicle_id in vehicle_ids) == 1,
+            name=f"visit_once[{stop_id}]",
+        )
+        model.addConstr(
+            late_min[stop_id] >= service_start_min[stop_id] - instance.stops[stop_id].latest_min,
+            name=f"late_lb[{stop_id}]",
+        )
+
+    symmetry_group_count = 0
+    for group in identical_vehicle_groups.values():
+        sorted_group = sorted(group)
+        if len(sorted_group) <= 1:
+            continue
+        symmetry_group_count += 1
+        for prev_vehicle_id, next_vehicle_id in zip(sorted_group, sorted_group[1:]):
+            model.addConstr(
+                use_vehicle[prev_vehicle_id] >= use_vehicle[next_vehicle_id],
+                name=f"symmetry_use_order[{prev_vehicle_id},{next_vehicle_id}]",
+            )
+            model.addConstr(
+                first_customer_index_expr[prev_vehicle_id]
+                <= first_customer_index_expr[next_vehicle_id]
+                + len(stop_ids)
+                * (2 - use_vehicle[prev_vehicle_id] - use_vehicle[next_vehicle_id]),
+                name=f"symmetry_first_customer[{prev_vehicle_id},{next_vehicle_id}]",
+            )
+
+    for vehicle_id in vehicle_ids:
+        vehicle = instance.vehicles[vehicle_id]
+
+        model.addConstr(starts[vehicle_id] == use_vehicle[vehicle_id], name=f"use_vehicle_start[{vehicle_id}]")
+        model.addConstr(returns[vehicle_id] == use_vehicle[vehicle_id], name=f"use_vehicle_return[{vehicle_id}]")
+        model.addConstr(
+            active_min_expr[vehicle_id] >= min_round_trip[vehicle_id] * use_vehicle[vehicle_id],
+            name=f"minimum_route_time[{vehicle_id}]",
+        )
+
+        for i, j in node_pairs:
+            model.addConstr(
+                x[vehicle_id, i, j] <= use_vehicle[vehicle_id],
+                name=f"arc_use_link[{vehicle_id},{i},{j}]",
+            )
+
+        for stop_id in stop_ids:
+            model.addConstr(
+                incoming[vehicle_id, stop_id] == outgoing[vehicle_id, stop_id],
+                name=f"flow[{vehicle_id},{stop_id}]",
+            )
+            model.addConstr(
+                incoming[vehicle_id, stop_id] <= use_vehicle[vehicle_id],
+                name=f"visit_use_link[{vehicle_id},{stop_id}]",
+            )
+
+        model.addConstr(
+            gp.quicksum(
+                instance.stops[stop_id].demand_kg * incoming[vehicle_id, stop_id]
+                for stop_id in stop_ids
+            )
+            <= vehicle.capacity_kg * use_vehicle[vehicle_id],
+            name=f"capacity[{vehicle_id}]",
+        )
+        model.addConstr(
+            depart_min[vehicle_id] == start_limit[vehicle_id] * use_vehicle[vehicle_id],
+            name=f"depart_fixed[{vehicle_id}]",
+        )
+        model.addConstr(
+            return_min[vehicle_id] >= depart_min[vehicle_id],
+            name=f"nonnegative_route_duration[{vehicle_id}]",
+        )
+        model.addConstr(
+            return_min[vehicle_id] <= end_limit[vehicle_id] * use_vehicle[vehicle_id],
+            name=f"return_ub[{vehicle_id}]",
+        )
+        model.addConstr(
+            active_min_expr[vehicle_id] <= 60.0 * billed_hours[vehicle_id],
+            name=f"billed_hours_lb[{vehicle_id}]",
+        )
+        model.addConstr(
+            billed_hours[vehicle_id]
+            <= billed_operating_hours(route_horizon[vehicle_id]) * use_vehicle[vehicle_id],
+            name=f"billed_hours_cap[{vehicle_id}]",
+        )
+
+        for stop_id in stop_ids:
+            if feasible_arc[vehicle_id, DEPOT_NODE, stop_id]:
+                model.addConstr(
+                    service_start_min[stop_id] - depart_min[vehicle_id]
+                    >= instance.travel_minutes[DEPOT_NODE, stop_id]
+                    - start_arc_m[vehicle_id, stop_id] * (1 - x[vehicle_id, DEPOT_NODE, stop_id]),
+                    name=f"time_from_depot[{vehicle_id},{stop_id}]",
+                )
+            if feasible_arc[vehicle_id, stop_id, DEPOT_NODE]:
+                model.addConstr(
+                    return_min[vehicle_id] - service_start_min[stop_id]
+                    >= instance.stops[stop_id].service_min
+                    + instance.travel_minutes[stop_id, DEPOT_NODE]
+                    - end_arc_m[vehicle_id, stop_id] * (1 - x[vehicle_id, stop_id, DEPOT_NODE]),
+                    name=f"time_to_depot[{vehicle_id},{stop_id}]",
+                )
+
+        for stop_id in stop_ids:
+            for next_stop in stop_ids:
+                if stop_id == next_stop or not feasible_arc[vehicle_id, stop_id, next_stop]:
+                    continue
+                model.addConstr(
+                    service_start_min[next_stop] - service_start_min[stop_id]
+                    >= instance.stops[stop_id].service_min
+                    + instance.travel_minutes[stop_id, next_stop]
+                    - stop_arc_m[vehicle_id, stop_id, next_stop] * (1 - x[vehicle_id, stop_id, next_stop]),
+                    name=f"time_between_stops[{vehicle_id},{stop_id},{next_stop}]",
+                )
+
+    objective = gp.quicksum(
+        distance_cost_expr[vehicle_id]
+        + instance.vehicles[vehicle_id].fixed_daily_cost * use_vehicle[vehicle_id]
+        + instance.cost_params["Driver_Hourly_Wage"] * billed_hours[vehicle_id]
+        for vehicle_id in vehicle_ids
+    ) + gp.quicksum(
+        instance.cost_params["Late_Delivery_Penalty_per_Hour"] / 60.0 * late_min[stop_id]
+        for stop_id in stop_ids
+    )
+    model.setObjective(objective, GRB.MINIMIZE)
+
+    model._data = {
+        "x": x,
+        "use_vehicle": use_vehicle,
+        "depart_min": depart_min,
+        "return_min": return_min,
+        "service_start_min": service_start_min,
+        "late_min": late_min,
+        "billed_hours": billed_hours,
+        "incoming": incoming,
+        "starts": starts,
+        "returns": returns,
+        "drive_min_expr": drive_min_expr,
+        "service_min_expr": service_min_expr,
+        "active_min_expr": active_min_expr,
+        "distance_cost_expr": distance_cost_expr,
+        "fixed_arc_count": fixed_arc_count,
+        "symmetry_group_count": symmetry_group_count,
+        "node_ids": node_ids,
+        "stop_ids": stop_ids,
+        "vehicle_ids": vehicle_ids,
+    }
+    return model, model._data
+
+
+def extract_arc_flow_route(data: dict[str, Any], vehicle_id: int) -> tuple[int, ...]:
+    x = data["x"]
+    stop_ids = data["stop_ids"]
+    route = [DEPOT_NODE]
+    current = DEPOT_NODE
+    seen_stops: set[int] = set()
+
+    while True:
+        next_nodes = [
+            node
+            for node in stop_ids + [DEPOT_NODE]
+            if node != current and (vehicle_id, current, node) in x and x[vehicle_id, current, node].X > 0.5
+        ]
+        if not next_nodes:
+            break
+        next_node = next_nodes[0]
+        route.append(next_node)
+        if next_node == DEPOT_NODE:
+            break
+        if next_node in seen_stops:
+            break
+        seen_stops.add(next_node)
+        current = next_node
+
+    return tuple(route)
+
+
+def solve_arc_flow_model(
+    workbook_path: Path,
+    time_limit: float | None,
+    mip_gap: float | None,
+    progress: ProgressTracker | None = None,
+    trace_logger: ObjectiveTraceLogger | None = None,
+) -> ArcFlowSolveResult:
+    instance = load_instance(workbook_path)
+    model, data = build_arc_flow_model(instance)
+
+    if time_limit is not None:
+        model.Params.TimeLimit = time_limit
+    if mip_gap is not None:
+        model.Params.MIPGap = mip_gap
+
+    optimize_with_heartbeat(model, progress=progress, label="arc-flow master MIP")
+    status = gurobi_status_name(model.Status)
+
+    best_bound: float | None
+    try:
+        best_bound = model.ObjBound
+    except gp.GurobiError:
+        best_bound = None
+
+    objective = model.ObjVal if model.SolCount > 0 else None
+    gap = relative_gap(objective, best_bound)
+
+    vehicle_solutions: list[ArcFlowVehicleSolution] = []
+    if model.SolCount > 0:
+        for vehicle_id in data["vehicle_ids"]:
+            if data["use_vehicle"][vehicle_id].X < 0.5:
+                continue
+            vehicle = instance.vehicles[vehicle_id]
+            route = extract_arc_flow_route(data, vehicle_id)
+            served_stops = [stop_id for stop_id in route if stop_id != DEPOT_NODE]
+            service_start_min = {
+                stop_id: data["service_start_min"][stop_id].X for stop_id in served_stops
+            }
+            late_min = {stop_id: data["late_min"][stop_id].X for stop_id in served_stops}
+            distance_cost = data["distance_cost_expr"][vehicle_id].getValue()
+            billed_hours = int(round(data["billed_hours"][vehicle_id].X))
+            route_cost = (
+                vehicle.fixed_daily_cost
+                + distance_cost
+                + billed_hours * instance.cost_params["Driver_Hourly_Wage"]
+                + sum(late_min.values()) / 60.0 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+            )
+            vehicle_solutions.append(
+                ArcFlowVehicleSolution(
+                    vehicle_id=vehicle_id,
+                    vehicle=vehicle,
+                    route=route,
+                    load_kg=sum(instance.stops[stop_id].demand_kg for stop_id in served_stops),
+                    depart_min=data["depart_min"][vehicle_id].X,
+                    return_min=data["return_min"][vehicle_id].X,
+                    drive_min=data["drive_min_expr"][vehicle_id].getValue(),
+                    service_min=data["service_min_expr"][vehicle_id].getValue(),
+                    active_min=data["active_min_expr"][vehicle_id].getValue(),
+                    billed_hours=billed_hours,
+                    distance_cost=distance_cost,
+                    route_cost=route_cost,
+                    service_start_min=service_start_min,
+                    late_min=late_min,
+                )
+            )
+
+    result = ArcFlowSolveResult(
+        status=status,
+        objective=objective,
+        best_bound=best_bound,
+        gap=gap,
+        vehicle_solutions=vehicle_solutions,
+        fixed_arc_count=data["fixed_arc_count"],
+        symmetry_group_count=data["symmetry_group_count"],
+    )
+
+    if trace_logger is not None:
+        trace_logger.record(
+            event="solve_end",
+            status=result.status,
+            incumbent_objective=result.objective,
+            best_bound=result.best_bound,
+            relative_gap=result.gap,
+            note="Arc-flow MIP finished",
+        )
+
+    print(f"Status: {result.status}")
+    print("Formulation: Arc-Flow MIP with Vehicle Symmetry Breaking")
+    print(f"Fixed impossible arcs: {result.fixed_arc_count}")
+    print(f"Symmetry groups: {result.symmetry_group_count}")
+    if result.best_bound is not None:
+        print(f"Best bound: {result.best_bound:.2f}")
+    if result.objective is not None:
+        print(f"Objective value: {result.objective:.2f}")
+    if result.gap is not None:
+        print(f"Relative gap: {100.0 * result.gap:.2f}%")
+    print()
+
+    if not result.vehicle_solutions:
+        print("No feasible solution found.")
+        return result
+
+    for vehicle_solution in result.vehicle_solutions:
+        print(f"Vehicle {vehicle_solution.vehicle_id} ({vehicle_solution.vehicle.vehicle_type})")
+        print(
+            "  "
+            f"Depart {minutes_to_clock(vehicle_solution.depart_min)}, "
+            f"Return {minutes_to_clock(vehicle_solution.return_min)}, "
+            f"Load {vehicle_solution.load_kg:.0f} / {vehicle_solution.vehicle.capacity_kg:.0f} kg"
+        )
+        print(
+            "  "
+            f"Active {vehicle_solution.active_min:.1f} min, Drive {vehicle_solution.drive_min:.1f} min, "
+            f"Service {vehicle_solution.service_min:.1f} min, Billed {vehicle_solution.billed_hours} h"
+        )
+        print(
+            "  "
+            f"Distance cost {vehicle_solution.distance_cost:.2f}, "
+            f"Route cost {vehicle_solution.route_cost:.2f}"
+        )
+        print(
+            "  Route: "
+            + " -> ".join(
+                "Depot" if node == DEPOT_NODE else f"Stop {node}"
+                for node in vehicle_solution.route
+            )
+        )
+        for stop_id in vehicle_solution.route:
+            if stop_id == DEPOT_NODE:
+                continue
+            print(
+                "    "
+                f"Stop {stop_id}: start {minutes_to_clock(vehicle_solution.service_start_min[stop_id])}, "
+                f"late {vehicle_solution.late_min[stop_id]:.1f} min"
+            )
+        print()
+
+    return result
 
 
 def best_stop_insertion(
@@ -2031,7 +2757,7 @@ def build_master_model(
     relax: bool,
     allow_artificial: bool = False,
 ) -> tuple[gp.Model, dict[str, Any]]:
-    model = gp.Model("route_based_master")
+    model = create_gurobi_model("route_based_master")
     model.Params.OutputFlag = 0
 
     route_indices = list(range(len(routes)))
@@ -2099,7 +2825,7 @@ def build_incremental_node_master(
     vehicle_types: dict[str, VehicleTypeData],
     routes: list[RouteColumn],
 ) -> NodeMasterLP:
-    model = gp.Model("route_based_node_master")
+    model = create_gurobi_model("route_based_node_master")
     model.Params.OutputFlag = 0
     model.ModelSense = GRB.MINIMIZE
 
@@ -2831,7 +3557,7 @@ def create_model(
     dual_stabilization_mode: str = "adaptive",
 ) -> tuple[gp.Model, dict[str, Any]]:
     instance = load_instance(workbook_path)
-    validate_route_based_assumptions(instance)
+    validate_shared_cost_assumptions(instance)
     vehicle_types = build_vehicle_types(instance)
     route_pool = initial_routes(instance, vehicle_types)
     route_key_set = {(route.type_id, route.stop_sequence) for route in route_pool}
@@ -2881,7 +3607,7 @@ def create_model(
             "dual_stabilization_mode": dual_stabilization_mode,
             "note": (
                 "This is the root restricted master over generated columns. "
-                "Exact solves happen through solve_model(), which runs branch-and-price."
+                "Use --route-based to run the newer exact branch-and-price solver."
             ),
         }
     )
@@ -2906,7 +3632,7 @@ def branch_and_price(
     checkpoint_manager: CheckpointManager | None = None,
     resume_from: Path | None = None,
 ) -> BranchAndPriceResult:
-    validate_route_based_assumptions(instance)
+    validate_shared_cost_assumptions(instance)
     vehicle_types = build_vehicle_types(instance)
     deadline = perf_counter() + time_limit if time_limit is not None else None
     checkpoint_state = (
@@ -3579,8 +4305,9 @@ def solve_model(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Solve the workbook-driven VRP with an exact branch-and-price algorithm "
-            "over a route-based set-partitioning master problem."
+            "Solve the workbook-driven VRP. By default this uses the older compact arc-flow "
+            "MIP with vehicle symmetry breaking; pass --route-based to run the newer "
+            "route-based branch-and-price solver."
         )
     )
     parser.add_argument(
@@ -3593,13 +4320,20 @@ def parse_args() -> argparse.Namespace:
         "--time-limit",
         type=float,
         default=None,
-        help="Optional overall branch-and-price time limit in seconds.",
+        help="Optional overall solve time limit in seconds.",
     )
     parser.add_argument(
         "--mip-gap",
         type=float,
         default=None,
-        help="Optional relative optimality gap target for branch-and-price.",
+        help="Optional relative MIP/optimality gap target for the active solver.",
+    )
+    parser.add_argument(
+        "--route-based",
+        "--branch-and-price",
+        dest="route_based",
+        action="store_true",
+        help="Use the newer route-based branch-and-price solver instead of the default arc-flow MIP.",
     )
     parser.add_argument(
         "--max-cg-iterations",
@@ -3607,7 +4341,7 @@ def parse_args() -> argparse.Namespace:
         default=200,
         help=(
             "Maximum column-generation iterations allowed at each tree node. "
-            "Use 0, 'none', or 'unlimited' for no cap."
+            "Use 0, 'none', or 'unlimited' for no cap. Only used with --route-based."
         ),
     )
     parser.add_argument(
@@ -3616,7 +4350,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional per-pricing time limit in seconds. "
-            "If a pricing solve hits this limit, the exact solve aborts."
+            "If a pricing solve hits this limit, the exact solve aborts. "
+            "Only used with --route-based."
         ),
     )
     parser.add_argument(
@@ -3625,7 +4360,7 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help=(
             "Maximum number of distinct improving routes to add per vehicle type in each "
-            "column-generation iteration."
+            "column-generation iteration. Only used with --route-based."
         ),
     )
     parser.add_argument(
@@ -3635,7 +4370,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Number of worker processes for pricing across vehicle types. "
             "Default: auto-select up to the number of vehicle types. Use 1 to disable "
-            "parallel pricing. You can also pass 'auto'."
+            "parallel pricing. You can also pass 'auto'. Only used with --route-based."
         ),
     )
     parser.add_argument(
@@ -3644,7 +4379,8 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help=(
             "Base exponential smoothing weight for pricing duals. "
-            "In adaptive mode this is the center value; use 1.0 for raw duals."
+            "In adaptive mode this is the center value; use 1.0 for raw duals. "
+            "Only used with --route-based."
         ),
     )
     parser.add_argument(
@@ -3653,27 +4389,28 @@ def parse_args() -> argparse.Namespace:
         default="adaptive",
         help=(
             "Use a fixed stabilization alpha every iteration, or adapt it based on "
-            "how much the raw duals move between CG iterations."
+            "how much the raw duals move between CG iterations. Only used with --route-based."
         ),
     )
     parser.add_argument(
         "--max-bp-nodes",
         type=int,
         default=None,
-        help="Optional cap on processed branch-and-price nodes.",
+        help="Optional cap on processed branch-and-price nodes. Only used with --route-based.",
     )
     parser.add_argument(
         "--unlimited",
         action="store_true",
         help=(
             "Run with no user-facing time, gap, node, pricing, or column-generation limits. "
-            "This also removes the restricted-master heuristic time cap."
+            "In default arc-flow mode this removes time and gap limits; in route-based mode "
+            "this also removes the restricted-master heuristic time cap."
         ),
     )
     parser.add_argument(
         "--progress",
         action="store_true",
-        help="Show throttled progress updates during branch-and-price.",
+        help="Show throttled progress updates during long solves.",
     )
     parser.add_argument(
         "--progress-interval",
@@ -3702,7 +4439,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional JSON checkpoint path. When set, save resumable branch-and-price "
             "state after each completed CG iteration and major tree updates. "
-            "Default: disabled unless --resume-from is provided."
+            "Only used with --route-based."
         ),
     )
     parser.add_argument(
@@ -3711,7 +4448,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Resume branch-and-price from a previously saved checkpoint JSON file. "
-            "If --checkpoint-path is omitted, the resumed run keeps writing to this file."
+            "If --checkpoint-path is omitted, the resumed run keeps writing to this file. "
+            "Only used with --route-based."
         ),
     )
     return parser.parse_args()
@@ -3721,14 +4459,39 @@ def main() -> None:
     global _INTERRUPT_SIGNAL_NAME
     _INTERRUPT_SIGNAL_NAME = None
     args = parse_args()
+    route_based_enabled = args.route_based
+    route_based_only_overrides: list[str] = []
+    if not route_based_enabled:
+        if args.max_cg_iterations != 200:
+            route_based_only_overrides.append("--max-cg-iterations")
+        if args.pricing_time_limit is not None:
+            route_based_only_overrides.append("--pricing-time-limit")
+        if args.pricing_columns_per_type != 3:
+            route_based_only_overrides.append("--pricing-columns-per-type")
+        if args.pricing_workers is not None:
+            route_based_only_overrides.append("--pricing-workers")
+        if abs(args.dual_stabilization_alpha - 0.5) > 1e-12:
+            route_based_only_overrides.append("--dual-stabilization-alpha")
+        if args.dual_stabilization_mode != "adaptive":
+            route_based_only_overrides.append("--dual-stabilization-mode")
+        if args.max_bp_nodes is not None:
+            route_based_only_overrides.append("--max-bp-nodes")
+        if args.checkpoint_path is not None:
+            route_based_only_overrides.append("--checkpoint-path")
+        if args.resume_from is not None:
+            route_based_only_overrides.append("--resume-from")
+    if route_based_only_overrides:
+        override_list = ", ".join(route_based_only_overrides)
+        raise SystemExit(f"{override_list} requires --route-based.")
     heuristic_time_limit = HEURISTIC_MASTER_TIME_LIMIT
     if args.unlimited:
         args.time_limit = None
         args.mip_gap = None
-        args.max_cg_iterations = None
-        args.pricing_time_limit = None
-        args.max_bp_nodes = None
-        heuristic_time_limit = None
+        if route_based_enabled:
+            args.max_cg_iterations = None
+            args.pricing_time_limit = None
+            args.max_bp_nodes = None
+            heuristic_time_limit = None
     progress = ProgressTracker(
         enabled=args.progress,
         interval_seconds=args.progress_interval,
@@ -3738,9 +4501,13 @@ def main() -> None:
         if args.no_objective_trace
         else (args.objective_trace or default_objective_trace_path(args.workbook))
     )
-    checkpoint_path = args.checkpoint_path or args.resume_from
+    checkpoint_path = (args.checkpoint_path or args.resume_from) if route_based_enabled else None
     checkpoint_manager = CheckpointManager(checkpoint_path)
     trace_logger = ObjectiveTraceLogger(objective_trace_path, args.workbook)
+    try:
+        configured_wls_license = resolve_gurobi_wls_license()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     previous_handlers = install_interrupt_handlers()
 
     try:
@@ -3753,23 +4520,34 @@ def main() -> None:
             )
         if checkpoint_manager.path is not None:
             print(f"Checkpoint path: {checkpoint_manager.path}")
-        solve_model(
-            workbook_path=args.workbook,
-            time_limit=args.time_limit,
-            mip_gap=args.mip_gap,
-            max_cg_iterations=args.max_cg_iterations,
-            pricing_time_limit=args.pricing_time_limit,
-            pricing_columns_per_type=args.pricing_columns_per_type,
-            pricing_workers=args.pricing_workers,
-            dual_stabilization_alpha=args.dual_stabilization_alpha,
-            dual_stabilization_mode=args.dual_stabilization_mode,
-            max_bp_nodes=args.max_bp_nodes,
-            heuristic_time_limit=heuristic_time_limit,
-            progress=progress,
-            trace_logger=trace_logger,
-            checkpoint_manager=checkpoint_manager,
-            resume_from=args.resume_from,
-        )
+        if configured_wls_license is not None:
+            print("Using Gurobi WLS credentials from .env, environment variables, or fallback script settings.")
+        if route_based_enabled:
+            solve_model(
+                workbook_path=args.workbook,
+                time_limit=args.time_limit,
+                mip_gap=args.mip_gap,
+                max_cg_iterations=args.max_cg_iterations,
+                pricing_time_limit=args.pricing_time_limit,
+                pricing_columns_per_type=args.pricing_columns_per_type,
+                pricing_workers=args.pricing_workers,
+                dual_stabilization_alpha=args.dual_stabilization_alpha,
+                dual_stabilization_mode=args.dual_stabilization_mode,
+                max_bp_nodes=args.max_bp_nodes,
+                heuristic_time_limit=heuristic_time_limit,
+                progress=progress,
+                trace_logger=trace_logger,
+                checkpoint_manager=checkpoint_manager,
+                resume_from=args.resume_from,
+            )
+        else:
+            solve_arc_flow_model(
+                workbook_path=args.workbook,
+                time_limit=args.time_limit,
+                mip_gap=args.mip_gap,
+                progress=progress,
+                trace_logger=trace_logger,
+            )
     except KeyboardInterrupt:
         interrupt_note = "Interrupted by user"
         if _INTERRUPT_SIGNAL_NAME is not None:
@@ -3785,6 +4563,7 @@ def main() -> None:
             print(f"{interrupt_note}. Latest checkpoint retained at {checkpoint_manager.path}")
         raise SystemExit(130) from None
     finally:
+        dispose_gurobi_env()
         restore_interrupt_handlers(previous_handlers)
         trace_logger.close()
 
