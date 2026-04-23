@@ -1773,6 +1773,8 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     service_start_lb: dict[int, float] = {}
     service_start_ub: dict[int, float] = {}
     late_ub: dict[int, float] = {}
+    visit_lb_shift: dict[tuple[int, int], float] = {}
+    visit_ub_shift: dict[tuple[int, int], float] = {}
     for stop_id in stop_ids:
         feasible_vehicles = [
             vehicle_id for vehicle_id in vehicle_ids if feasible_vehicle_stop[vehicle_id, stop_id]
@@ -1791,6 +1793,15 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             service_start_ub[stop_id] - instance.stops[stop_id].latest_min,
             0.0,
         )
+        for vehicle_id in vehicle_ids:
+            visit_lb_shift[vehicle_id, stop_id] = max(
+                vehicle_stop_lb[vehicle_id, stop_id] - service_start_lb[stop_id],
+                0.0,
+            )
+            visit_ub_shift[vehicle_id, stop_id] = max(
+                service_start_ub[stop_id] - vehicle_stop_ub[vehicle_id, stop_id],
+                0.0,
+            )
 
     feasible_arc: dict[tuple[int, int, int], bool] = {}
     start_arc_m: dict[tuple[int, int], float] = {}
@@ -1836,6 +1847,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 )
 
     x = model.addVars(arc_keys, vtype=GRB.BINARY, name="x")
+    visit = model.addVars(vehicle_ids, stop_ids, vtype=GRB.BINARY, name="visit")
     use_vehicle = model.addVars(vehicle_ids, vtype=GRB.BINARY, name="use_vehicle")
     depart_min = model.addVars(vehicle_ids, lb=0.0, ub=max_time_bound, name="depart_min")
     return_min = model.addVars(vehicle_ids, lb=0.0, ub=max_time_bound, name="return_min")
@@ -1859,6 +1871,10 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         if not feasible_arc.get((vehicle_id, i, j), False):
             x[vehicle_id, i, j].ub = 0.0
             fixed_arc_count += 1
+    for vehicle_id in vehicle_ids:
+        for stop_id in stop_ids:
+            if not feasible_vehicle_stop[vehicle_id, stop_id]:
+                visit[vehicle_id, stop_id].ub = 0.0
 
     incoming = {
         (vehicle_id, stop_id): gp.quicksum(
@@ -1897,7 +1913,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     }
     service_min_expr = {
         vehicle_id: gp.quicksum(
-            instance.stops[stop_id].service_min * incoming[vehicle_id, stop_id]
+            instance.stops[stop_id].service_min * visit[vehicle_id, stop_id]
             for stop_id in stop_ids
         )
         for vehicle_id in vehicle_ids
@@ -1921,7 +1937,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
 
     for stop_id in stop_ids:
         model.addConstr(
-            gp.quicksum(incoming[vehicle_id, stop_id] for vehicle_id in vehicle_ids) == 1,
+            gp.quicksum(visit[vehicle_id, stop_id] for vehicle_id in vehicle_ids) == 1,
             name=f"visit_once[{stop_id}]",
         )
         model.addConstr(
@@ -1966,17 +1982,21 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
 
         for stop_id in stop_ids:
             model.addConstr(
-                incoming[vehicle_id, stop_id] == outgoing[vehicle_id, stop_id],
-                name=f"flow[{vehicle_id},{stop_id}]",
+                incoming[vehicle_id, stop_id] == visit[vehicle_id, stop_id],
+                name=f"incoming_visit[{vehicle_id},{stop_id}]",
             )
             model.addConstr(
-                incoming[vehicle_id, stop_id] <= use_vehicle[vehicle_id],
+                outgoing[vehicle_id, stop_id] == visit[vehicle_id, stop_id],
+                name=f"outgoing_visit[{vehicle_id},{stop_id}]",
+            )
+            model.addConstr(
+                visit[vehicle_id, stop_id] <= use_vehicle[vehicle_id],
                 name=f"visit_use_link[{vehicle_id},{stop_id}]",
             )
 
         model.addConstr(
             gp.quicksum(
-                instance.stops[stop_id].demand_kg * incoming[vehicle_id, stop_id]
+                instance.stops[stop_id].demand_kg * visit[vehicle_id, stop_id]
                 for stop_id in stop_ids
             )
             <= vehicle.capacity_kg * use_vehicle[vehicle_id],
@@ -2005,6 +2025,18 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         )
 
         for stop_id in stop_ids:
+            model.addConstr(
+                service_start_min[stop_id]
+                >= vehicle_stop_lb[vehicle_id, stop_id]
+                - visit_lb_shift[vehicle_id, stop_id] * (1 - visit[vehicle_id, stop_id]),
+                name=f"visit_time_lb[{vehicle_id},{stop_id}]",
+            )
+            model.addConstr(
+                service_start_min[stop_id]
+                <= vehicle_stop_ub[vehicle_id, stop_id]
+                + visit_ub_shift[vehicle_id, stop_id] * (1 - visit[vehicle_id, stop_id]),
+                name=f"visit_time_ub[{vehicle_id},{stop_id}]",
+            )
             if feasible_arc[vehicle_id, DEPOT_NODE, stop_id]:
                 model.addConstr(
                     service_start_min[stop_id] - depart_min[vehicle_id]
@@ -2046,6 +2078,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
 
     model._data = {
         "x": x,
+        "visit": visit,
         "use_vehicle": use_vehicle,
         "depart_min": depart_min,
         "return_min": return_min,
