@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import heapq
+import json
 import math
 import multiprocessing as mp
 import os
@@ -11,10 +12,9 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time
-from itertools import count
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 import gurobipy as gp
 from gurobipy import GRB
@@ -152,6 +152,40 @@ class BranchAndPriceResult:
     nodes_pruned: int
     global_columns: int
     root_lp_objective: float | None
+
+
+@dataclass
+class NodeRelaxationCheckpointState:
+    iteration: int
+    last_lp_objective: float | None
+    active_routes: list[RouteColumn]
+    stabilized_cover_duals: dict[int, float] | None
+    stabilized_type_duals: dict[str, float] | None
+    previous_raw_cover_duals: dict[int, float] | None
+    previous_raw_type_duals: dict[str, float] | None
+
+
+@dataclass
+class CurrentNodeCheckpointState:
+    lower_bound_hint: float
+    depth: int
+    sequence_id: int
+    branch_state: BranchState
+    relaxation_state: NodeRelaxationCheckpointState | None
+
+
+@dataclass
+class BranchAndPriceCheckpointState:
+    route_pool: list[RouteColumn]
+    active_nodes: list[tuple[float, int, int, BranchState]]
+    next_sequence_id: int
+    incumbent_obj: float | None
+    incumbent_routes: list[RouteColumn]
+    root_lp_objective: float | None
+    nodes_processed: int
+    nodes_pruned: int
+    current_node: CurrentNodeCheckpointState | None
+    status: str
 
 
 @dataclass(frozen=True)
@@ -292,6 +326,334 @@ class ObjectiveTraceLogger:
         self._file.close()
         self._file = None
         self._writer = None
+
+
+def serialize_route_ref(route: RouteColumn) -> dict[str, Any]:
+    return {
+        "type_id": route.type_id,
+        "stop_sequence": list(route.stop_sequence),
+    }
+
+
+def deserialize_route_refs(
+    serialized_routes: list[dict[str, Any]],
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    route_lookup: dict[tuple[str, tuple[int, ...]], RouteColumn] | None = None,
+) -> list[RouteColumn]:
+    routes: list[RouteColumn] = []
+    for item in serialized_routes:
+        type_id = str(item["type_id"])
+        stop_sequence = tuple(int(stop_id) for stop_id in item["stop_sequence"])
+        key = (type_id, stop_sequence)
+        route = route_lookup.get(key) if route_lookup is not None else None
+        if route is None:
+            vehicle_type = vehicle_types.get(type_id)
+            if vehicle_type is None:
+                raise ValueError(f"Checkpoint refers to unknown vehicle type {type_id!r}.")
+            route = evaluate_route_sequence(instance, vehicle_type, stop_sequence)
+        if route is None:
+            raise ValueError(
+                f"Checkpoint route {type_id} {stop_sequence} is infeasible under the workbook data."
+            )
+        routes.append(route)
+    return routes
+
+
+def serialize_branch_state(branch_state: BranchState) -> dict[str, Any]:
+    return {
+        "forbidden_arcs": [list(arc) for arc in sorted(branch_state.forbidden_arcs)],
+        "forced_arcs": [list(arc) for arc in sorted(branch_state.forced_arcs)],
+        "excluded_assignments": [
+            [stop_id, type_id]
+            for stop_id, type_id in sorted(branch_state.excluded_assignments)
+        ],
+        "forced_assignments": [
+            [stop_id, type_id] for stop_id, type_id in sorted(branch_state.forced_assignments)
+        ],
+        "same_route_pairs": [list(pair) for pair in sorted(branch_state.same_route_pairs)],
+        "different_route_pairs": [
+            list(pair) for pair in sorted(branch_state.different_route_pairs)
+        ],
+    }
+
+
+def deserialize_branch_state(data: dict[str, Any]) -> BranchState:
+    return BranchState(
+        forbidden_arcs=frozenset(
+            (int(arc[0]), int(arc[1])) for arc in data.get("forbidden_arcs", [])
+        ),
+        forced_arcs=frozenset(
+            (int(arc[0]), int(arc[1])) for arc in data.get("forced_arcs", [])
+        ),
+        excluded_assignments=frozenset(
+            (int(item[0]), str(item[1])) for item in data.get("excluded_assignments", [])
+        ),
+        forced_assignments=frozenset(
+            (int(item[0]), str(item[1])) for item in data.get("forced_assignments", [])
+        ),
+        same_route_pairs=frozenset(
+            (int(pair[0]), int(pair[1])) for pair in data.get("same_route_pairs", [])
+        ),
+        different_route_pairs=frozenset(
+            (int(pair[0]), int(pair[1])) for pair in data.get("different_route_pairs", [])
+        ),
+    )
+
+
+def serialize_int_keyed_float_map(values: dict[int, float] | None) -> dict[str, float] | None:
+    if values is None:
+        return None
+    return {str(key): float(values[key]) for key in sorted(values)}
+
+
+def deserialize_int_keyed_float_map(
+    data: dict[str, Any] | None,
+) -> dict[int, float] | None:
+    if data is None:
+        return None
+    return {int(key): float(value) for key, value in data.items()}
+
+
+def serialize_str_keyed_float_map(values: dict[str, float] | None) -> dict[str, float] | None:
+    if values is None:
+        return None
+    return {str(key): float(values[key]) for key in sorted(values)}
+
+
+def deserialize_str_keyed_float_map(
+    data: dict[str, Any] | None,
+) -> dict[str, float] | None:
+    if data is None:
+        return None
+    return {str(key): float(value) for key, value in data.items()}
+
+
+def serialize_node_relaxation_checkpoint(
+    checkpoint_state: NodeRelaxationCheckpointState | None,
+) -> dict[str, Any] | None:
+    if checkpoint_state is None:
+        return None
+    return {
+        "iteration": checkpoint_state.iteration,
+        "last_lp_objective": checkpoint_state.last_lp_objective,
+        "active_routes": [
+            serialize_route_ref(route) for route in checkpoint_state.active_routes
+        ],
+        "stabilized_cover_duals": serialize_int_keyed_float_map(
+            checkpoint_state.stabilized_cover_duals
+        ),
+        "stabilized_type_duals": serialize_str_keyed_float_map(
+            checkpoint_state.stabilized_type_duals
+        ),
+        "previous_raw_cover_duals": serialize_int_keyed_float_map(
+            checkpoint_state.previous_raw_cover_duals
+        ),
+        "previous_raw_type_duals": serialize_str_keyed_float_map(
+            checkpoint_state.previous_raw_type_duals
+        ),
+    }
+
+
+def deserialize_node_relaxation_checkpoint(
+    data: dict[str, Any] | None,
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    route_lookup: dict[tuple[str, tuple[int, ...]], RouteColumn],
+) -> NodeRelaxationCheckpointState | None:
+    if data is None:
+        return None
+    return NodeRelaxationCheckpointState(
+        iteration=int(data["iteration"]),
+        last_lp_objective=(
+            None if data.get("last_lp_objective") is None else float(data["last_lp_objective"])
+        ),
+        active_routes=deserialize_route_refs(
+            data.get("active_routes", []),
+            instance=instance,
+            vehicle_types=vehicle_types,
+            route_lookup=route_lookup,
+        ),
+        stabilized_cover_duals=deserialize_int_keyed_float_map(
+            data.get("stabilized_cover_duals")
+        ),
+        stabilized_type_duals=deserialize_str_keyed_float_map(
+            data.get("stabilized_type_duals")
+        ),
+        previous_raw_cover_duals=deserialize_int_keyed_float_map(
+            data.get("previous_raw_cover_duals")
+        ),
+        previous_raw_type_duals=deserialize_str_keyed_float_map(
+            data.get("previous_raw_type_duals")
+        ),
+    )
+
+
+def serialize_current_node_checkpoint(
+    current_node: CurrentNodeCheckpointState | None,
+) -> dict[str, Any] | None:
+    if current_node is None:
+        return None
+    return {
+        "lower_bound_hint": current_node.lower_bound_hint,
+        "depth": current_node.depth,
+        "sequence_id": current_node.sequence_id,
+        "branch_state": serialize_branch_state(current_node.branch_state),
+        "relaxation_state": serialize_node_relaxation_checkpoint(current_node.relaxation_state),
+    }
+
+
+def deserialize_current_node_checkpoint(
+    data: dict[str, Any] | None,
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    route_lookup: dict[tuple[str, tuple[int, ...]], RouteColumn],
+) -> CurrentNodeCheckpointState | None:
+    if data is None:
+        return None
+    return CurrentNodeCheckpointState(
+        lower_bound_hint=float(data["lower_bound_hint"]),
+        depth=int(data["depth"]),
+        sequence_id=int(data["sequence_id"]),
+        branch_state=deserialize_branch_state(data["branch_state"]),
+        relaxation_state=deserialize_node_relaxation_checkpoint(
+            data.get("relaxation_state"),
+            instance=instance,
+            vehicle_types=vehicle_types,
+            route_lookup=route_lookup,
+        ),
+    )
+
+
+class CheckpointManager:
+    VERSION = 1
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+
+    def _write_payload(self, payload: dict[str, Any]) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_name(f"{self.path.name}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, self.path)
+
+    def save_branch_and_price_state(
+        self,
+        *,
+        workbook_path: Path,
+        route_pool: list[RouteColumn],
+        active_nodes: list[tuple[float, int, int, BranchState]],
+        next_sequence_id: int,
+        incumbent_obj: float | None,
+        incumbent_routes: list[RouteColumn],
+        root_lp_objective: float | None,
+        nodes_processed: int,
+        nodes_pruned: int,
+        current_node: CurrentNodeCheckpointState | None,
+        status: str,
+        note: str,
+    ) -> None:
+        if self.path is None:
+            return
+        payload = {
+            "version": self.VERSION,
+            "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "workbook_path": str(workbook_path.resolve()),
+            "status": status,
+            "note": note,
+            "route_pool": [serialize_route_ref(route) for route in route_pool],
+            "active_nodes": [
+                {
+                    "bound": bound,
+                    "depth": depth,
+                    "sequence_id": sequence_id,
+                    "branch_state": serialize_branch_state(branch_state),
+                }
+                for bound, depth, sequence_id, branch_state in active_nodes
+            ],
+            "next_sequence_id": next_sequence_id,
+            "incumbent_obj": incumbent_obj,
+            "incumbent_routes": [serialize_route_ref(route) for route in incumbent_routes],
+            "root_lp_objective": root_lp_objective,
+            "nodes_processed": nodes_processed,
+            "nodes_pruned": nodes_pruned,
+            "current_node": serialize_current_node_checkpoint(current_node),
+        }
+        self._write_payload(payload)
+
+
+def load_branch_and_price_checkpoint(
+    checkpoint_path: Path,
+    *,
+    workbook_path: Path,
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+) -> BranchAndPriceCheckpointState:
+    with checkpoint_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    if int(payload.get("version", -1)) != CheckpointManager.VERSION:
+        raise ValueError(
+            f"Checkpoint version {payload.get('version')!r} is not supported by this solver."
+        )
+
+    saved_workbook_path = Path(payload["workbook_path"]).resolve()
+    if saved_workbook_path != workbook_path.resolve():
+        raise ValueError(
+            "Checkpoint workbook path does not match the requested workbook. "
+            f"Checkpoint: {saved_workbook_path}, requested: {workbook_path.resolve()}"
+        )
+
+    route_pool = deserialize_route_refs(
+        payload.get("route_pool", []),
+        instance=instance,
+        vehicle_types=vehicle_types,
+    )
+    route_lookup = {route_column_key(route): route for route in route_pool}
+    active_nodes = [
+        (
+            float(item["bound"]),
+            int(item["depth"]),
+            int(item["sequence_id"]),
+            deserialize_branch_state(item["branch_state"]),
+        )
+        for item in payload.get("active_nodes", [])
+    ]
+
+    return BranchAndPriceCheckpointState(
+        route_pool=route_pool,
+        active_nodes=active_nodes,
+        next_sequence_id=int(payload.get("next_sequence_id", len(active_nodes))),
+        incumbent_obj=(
+            None if payload.get("incumbent_obj") is None else float(payload["incumbent_obj"])
+        ),
+        incumbent_routes=deserialize_route_refs(
+            payload.get("incumbent_routes", []),
+            instance=instance,
+            vehicle_types=vehicle_types,
+            route_lookup=route_lookup,
+        ),
+        root_lp_objective=(
+            None
+            if payload.get("root_lp_objective") is None
+            else float(payload["root_lp_objective"])
+        ),
+        nodes_processed=int(payload.get("nodes_processed", 0)),
+        nodes_pruned=int(payload.get("nodes_pruned", 0)),
+        current_node=deserialize_current_node_checkpoint(
+            payload.get("current_node"),
+            instance=instance,
+            vehicle_types=vehicle_types,
+            route_lookup=route_lookup,
+        ),
+        status=str(payload.get("status", "UNKNOWN")),
+    )
 
 
 def optimize_with_heartbeat(
@@ -1813,31 +2175,88 @@ def solve_node_relaxation(
     deadline: float | None,
     progress: ProgressTracker | None = None,
     node_label: str = "root",
+    resume_state: NodeRelaxationCheckpointState | None = None,
+    checkpoint_callback: Callable[[NodeRelaxationCheckpointState], None] | None = None,
 ) -> NodeRelaxationResult | None:
     branch_ctx = build_branch_context(branch_state, instance, vehicle_types)
     if branch_ctx is None:
         return None
 
     compatible_routes = [route for route in route_pool if route_is_compatible(route, branch_ctx)]
-    initial_active_routes = select_initial_active_routes(
-        instance=instance,
-        vehicle_types=vehicle_types,
-        compatible_routes=compatible_routes,
-    )
-    if not initial_active_routes:
-        initial_active_routes = compatible_routes[:]
+    compatible_route_lookup = {
+        route_column_key(route): route for route in compatible_routes
+    }
+    if resume_state is None:
+        active_routes = select_initial_active_routes(
+            instance=instance,
+            vehicle_types=vehicle_types,
+            compatible_routes=compatible_routes,
+        )
+        if not active_routes:
+            active_routes = compatible_routes[:]
+        last_lp_objective = float("nan")
+        iteration = 0
+        stabilized_cover_duals: dict[int, float] | None = None
+        stabilized_type_duals: dict[str, float] | None = None
+        previous_raw_cover_duals: dict[int, float] | None = None
+        previous_raw_type_duals: dict[str, float] | None = None
+    else:
+        active_routes = []
+        for route in resume_state.active_routes:
+            key = route_column_key(route)
+            resumed_route = compatible_route_lookup.get(key)
+            if resumed_route is None:
+                raise ValueError(
+                    f"Checkpoint route {key} is no longer compatible with branch state {node_label}."
+                )
+            active_routes.append(resumed_route)
+        if not active_routes:
+            active_routes = compatible_routes[:]
+        last_lp_objective = (
+            resume_state.last_lp_objective
+            if resume_state.last_lp_objective is not None
+            else float("nan")
+        )
+        iteration = resume_state.iteration
+        stabilized_cover_duals = (
+            dict(resume_state.stabilized_cover_duals)
+            if resume_state.stabilized_cover_duals is not None
+            else None
+        )
+        stabilized_type_duals = (
+            dict(resume_state.stabilized_type_duals)
+            if resume_state.stabilized_type_duals is not None
+            else None
+        )
+        previous_raw_cover_duals = (
+            dict(resume_state.previous_raw_cover_duals)
+            if resume_state.previous_raw_cover_duals is not None
+            else None
+        )
+        previous_raw_type_duals = (
+            dict(resume_state.previous_raw_type_duals)
+            if resume_state.previous_raw_type_duals is not None
+            else None
+        )
     node_master = build_incremental_node_master(
         instance=instance,
         vehicle_types=vehicle_types,
-        routes=initial_active_routes,
+        routes=active_routes,
     )
-    last_lp_objective = float("nan")
     if progress is not None:
-        progress.emit(
-            f"{node_label}: starting node relaxation with {len(initial_active_routes)} active "
-            f"columns out of {len(compatible_routes)} compatible global columns",
-            force=True,
-        )
+        if resume_state is None:
+            progress.emit(
+                f"{node_label}: starting node relaxation with {len(active_routes)} active "
+                f"columns out of {len(compatible_routes)} compatible global columns",
+                force=True,
+            )
+        else:
+            progress.emit(
+                f"{node_label}: resuming node relaxation from CG iteration {iteration} with "
+                f"{len(active_routes)} active columns out of {len(compatible_routes)} "
+                "compatible global columns",
+                force=True,
+            )
 
     route_sequences_by_type: dict[str, set[tuple[int, ...]]] = {
         type_id: set() for type_id in vehicle_types
@@ -1849,7 +2268,7 @@ def solve_node_relaxation(
     inactive_routes_by_type: dict[str, dict[tuple[str, tuple[int, ...]], RouteColumn]] = {
         type_id: {} for type_id in vehicle_types
     }
-    active_route_keys = {route_column_key(route) for route in initial_active_routes}
+    active_route_keys = {route_column_key(route) for route in active_routes}
     for route in compatible_routes:
         key = route_column_key(route)
         if key not in active_route_keys:
@@ -1935,12 +2354,36 @@ def solve_node_relaxation(
             routes_by_type[type_id] = routes
         return routes_by_type
 
-    stabilized_cover_duals: dict[int, float] | None = None
-    stabilized_type_duals: dict[str, float] | None = None
-    previous_raw_cover_duals: dict[int, float] | None = None
-    previous_raw_type_duals: dict[str, float] | None = None
+    def emit_checkpoint() -> None:
+        if checkpoint_callback is None:
+            return
+        checkpoint_callback(
+            NodeRelaxationCheckpointState(
+                iteration=iteration,
+                last_lp_objective=(
+                    None if math.isnan(last_lp_objective) else last_lp_objective
+                ),
+                active_routes=list(node_master.routes),
+                stabilized_cover_duals=(
+                    None if stabilized_cover_duals is None else dict(stabilized_cover_duals)
+                ),
+                stabilized_type_duals=(
+                    None if stabilized_type_duals is None else dict(stabilized_type_duals)
+                ),
+                previous_raw_cover_duals=(
+                    None
+                    if previous_raw_cover_duals is None
+                    else dict(previous_raw_cover_duals)
+                ),
+                previous_raw_type_duals=(
+                    None
+                    if previous_raw_type_duals is None
+                    else dict(previous_raw_type_duals)
+                ),
+            )
+        )
+
     try:
-        iteration = 0
         while max_cg_iterations is None or iteration < max_cg_iterations:
             iteration += 1
             if progress is not None:
@@ -2022,6 +2465,7 @@ def solve_node_relaxation(
                         f"global column pool is now {len(route_pool)}"
                     )
                 node_master.model.update()
+                emit_checkpoint()
                 continue
 
             found_raw_improving_route = False
@@ -2099,6 +2543,7 @@ def solve_node_relaxation(
                     f"global column pool is now {len(route_pool)}"
                 )
             node_master.model.update()
+            emit_checkpoint()
 
         raise RuntimeError(
             "Maximum column-generation iterations reached before node convergence. "
@@ -2445,6 +2890,7 @@ def create_model(
 
 def branch_and_price(
     instance: Instance,
+    workbook_path: Path,
     time_limit: float | None,
     mip_gap: float | None,
     max_cg_iterations: int | None,
@@ -2457,39 +2903,98 @@ def branch_and_price(
     heuristic_time_limit: float | None,
     progress: ProgressTracker | None = None,
     trace_logger: ObjectiveTraceLogger | None = None,
+    checkpoint_manager: CheckpointManager | None = None,
+    resume_from: Path | None = None,
 ) -> BranchAndPriceResult:
     validate_route_based_assumptions(instance)
     vehicle_types = build_vehicle_types(instance)
-    route_pool = initial_routes(instance, vehicle_types)
-    route_key_set = {(route.type_id, route.stop_sequence) for route in route_pool}
-
-    root_state = BranchState(
-        forbidden_arcs=frozenset(),
-        forced_arcs=frozenset(),
-        excluded_assignments=frozenset(),
-        forced_assignments=frozenset(),
-        same_route_pairs=frozenset(),
-        different_route_pairs=frozenset(),
+    deadline = perf_counter() + time_limit if time_limit is not None else None
+    checkpoint_state = (
+        load_branch_and_price_checkpoint(
+            resume_from,
+            workbook_path=workbook_path,
+            instance=instance,
+            vehicle_types=vehicle_types,
+        )
+        if resume_from is not None
+        else None
     )
 
-    deadline = perf_counter() + time_limit if time_limit is not None else None
-    active_nodes: list[tuple[float, int, int, BranchState]] = []
-    sequence_counter = count()
-    heapq.heappush(active_nodes, (0.0, 0, next(sequence_counter), root_state))
+    if checkpoint_state is None:
+        route_pool = initial_routes(instance, vehicle_types)
+        active_nodes: list[tuple[float, int, int, BranchState]] = []
+        next_sequence_id = 0
 
-    incumbent_obj: float | None = None
-    incumbent_routes: list[RouteColumn] = []
-    root_lp_objective: float | None = None
-    nodes_processed = 0
-    nodes_pruned = 0
+        def allocate_sequence_id() -> int:
+            nonlocal next_sequence_id
+            sequence_id = next_sequence_id
+            next_sequence_id += 1
+            return sequence_id
+
+        root_state = BranchState(
+            forbidden_arcs=frozenset(),
+            forced_arcs=frozenset(),
+            excluded_assignments=frozenset(),
+            forced_assignments=frozenset(),
+            same_route_pairs=frozenset(),
+            different_route_pairs=frozenset(),
+        )
+        heapq.heappush(active_nodes, (0.0, 0, allocate_sequence_id(), root_state))
+        incumbent_obj: float | None = None
+        incumbent_routes: list[RouteColumn] = []
+        root_lp_objective: float | None = None
+        nodes_processed = 0
+        nodes_pruned = 0
+        current_node: CurrentNodeCheckpointState | None = None
+    else:
+        route_pool = list(checkpoint_state.route_pool)
+        active_nodes = list(checkpoint_state.active_nodes)
+        next_sequence_id = checkpoint_state.next_sequence_id
+
+        def allocate_sequence_id() -> int:
+            nonlocal next_sequence_id
+            sequence_id = next_sequence_id
+            next_sequence_id += 1
+            return sequence_id
+
+        incumbent_obj = checkpoint_state.incumbent_obj
+        incumbent_routes = list(checkpoint_state.incumbent_routes)
+        root_lp_objective = checkpoint_state.root_lp_objective
+        nodes_processed = checkpoint_state.nodes_processed
+        nodes_pruned = checkpoint_state.nodes_pruned
+        current_node = checkpoint_state.current_node
+    route_key_set = {(route.type_id, route.stop_sequence) for route in route_pool}
     status = "UNKNOWN"
 
+    def pending_node_count() -> int:
+        return len(active_nodes) + (1 if current_node is not None else 0)
+
+    def save_checkpoint(note: str) -> None:
+        if checkpoint_manager is None:
+            return
+        checkpoint_manager.save_branch_and_price_state(
+            workbook_path=workbook_path,
+            route_pool=route_pool,
+            active_nodes=active_nodes,
+            next_sequence_id=next_sequence_id,
+            incumbent_obj=incumbent_obj,
+            incumbent_routes=incumbent_routes,
+            root_lp_objective=root_lp_objective,
+            nodes_processed=nodes_processed,
+            nodes_pruned=nodes_pruned,
+            current_node=current_node,
+            status=status,
+            note=note,
+        )
+
     def current_global_bound(active_node_hint: float | None = None) -> float | None:
-        if root_lp_objective is None and nodes_processed == 0:
+        if root_lp_objective is None and nodes_processed == 0 and current_node is None:
             return None
         candidate_bounds: list[float] = []
         if active_node_hint is not None:
             candidate_bounds.append(active_node_hint)
+        if current_node is not None:
+            candidate_bounds.append(current_node.lower_bound_hint)
         if active_nodes:
             candidate_bounds.append(min(bound for bound, *_ in active_nodes))
         if candidate_bounds:
@@ -2527,50 +3032,65 @@ def branch_and_price(
             nodes_processed=nodes_processed,
             nodes_pruned=nodes_pruned,
             global_columns=len(route_pool),
-            queue_size=len(active_nodes),
+            queue_size=pending_node_count(),
             node_depth=node_depth,
             note=note,
         )
         last_logged_incumbent = incumbent_obj
         last_logged_bound = best_bound
 
-    if progress is not None:
-        progress.emit(
-            f"Starting branch-and-price with {len(route_pool)} initial columns",
-            force=True,
-        )
-    maybe_record_trace(
-        "run_start",
-        force=True,
-        note=f"Initial route pool has {len(route_pool)} columns",
-    )
-
-    try:
-        initial_heuristic = solve_restricted_integer_master(
-            instance=instance,
-            vehicle_types=vehicle_types,
-            routes=route_pool,
-            deadline=deadline,
-            heuristic_time_limit=heuristic_time_limit,
-            progress=progress,
-            progress_label="initial restricted-master heuristic",
-        )
-    except TimeoutError:
-        initial_heuristic = None
-    if initial_heuristic is not None:
-        incumbent_obj, incumbent_routes = initial_heuristic
+    if checkpoint_state is None:
         if progress is not None:
             progress.emit(
-                f"Initial restricted-master incumbent: {incumbent_obj:.2f}",
+                f"Starting branch-and-price with {len(route_pool)} initial columns",
                 force=True,
             )
         maybe_record_trace(
-            "incumbent_update",
+            "run_start",
             force=True,
-            note="Initial restricted-master incumbent",
+            note=f"Initial route pool has {len(route_pool)} columns",
+        )
+        save_checkpoint(f"Initialized branch-and-price with {len(route_pool)} initial columns")
+
+        try:
+            initial_heuristic = solve_restricted_integer_master(
+                instance=instance,
+                vehicle_types=vehicle_types,
+                routes=route_pool,
+                deadline=deadline,
+                heuristic_time_limit=heuristic_time_limit,
+                progress=progress,
+                progress_label="initial restricted-master heuristic",
+            )
+        except TimeoutError:
+            initial_heuristic = None
+        if initial_heuristic is not None:
+            incumbent_obj, incumbent_routes = initial_heuristic
+            if progress is not None:
+                progress.emit(
+                    f"Initial restricted-master incumbent: {incumbent_obj:.2f}",
+                    force=True,
+                )
+            maybe_record_trace(
+                "incumbent_update",
+                force=True,
+                note="Initial restricted-master incumbent",
+            )
+            save_checkpoint("Captured initial restricted-master incumbent")
+    else:
+        if progress is not None:
+            progress.emit(
+                f"Resuming branch-and-price from {resume_from} with {len(route_pool)} "
+                f"global columns and {pending_node_count()} pending nodes",
+                force=True,
+            )
+        maybe_record_trace(
+            "run_resume",
+            force=True,
+            note=f"Resumed from checkpoint {resume_from}",
         )
 
-    while active_nodes:
+    while current_node is not None or active_nodes:
         if max_bp_nodes is not None and nodes_processed >= max_bp_nodes:
             status = "NODE_LIMIT"
             break
@@ -2578,21 +3098,49 @@ def branch_and_price(
             status = "TIME_LIMIT"
             break
 
-        lower_bound_hint, depth, _, branch_state = heapq.heappop(active_nodes)
+        if current_node is None:
+            lower_bound_hint, depth, sequence_id, branch_state = heapq.heappop(active_nodes)
+            current_node = CurrentNodeCheckpointState(
+                lower_bound_hint=lower_bound_hint,
+                depth=depth,
+                sequence_id=sequence_id,
+                branch_state=branch_state,
+                relaxation_state=None,
+            )
+            save_checkpoint(f"Started node at depth {depth}")
+
+        lower_bound_hint = current_node.lower_bound_hint
+        depth = current_node.depth
+        branch_state = current_node.branch_state
         if incumbent_obj is not None and lower_bound_hint >= incumbent_obj - INTEGRALITY_TOL:
             nodes_pruned += 1
+            current_node = None
             maybe_record_trace(
                 "bound_update",
                 note="Pruned queued node by incumbent cutoff",
+                node_depth=depth,
             )
+            save_checkpoint("Pruned pending node by incumbent cutoff")
             continue
 
         if progress is not None:
             incumbent_text = "none" if incumbent_obj is None else f"{incumbent_obj:.2f}"
             progress.emit(
-                f"Exploring node depth {depth}, queue {len(active_nodes)}, "
+                f"Exploring node depth {depth}, queue {pending_node_count() - 1}, "
                 f"best hint {lower_bound_hint:.2f}, incumbent {incumbent_text}"
             )
+
+        def save_node_relaxation_checkpoint(
+            node_checkpoint: NodeRelaxationCheckpointState,
+        ) -> None:
+            if current_node is None:
+                return
+            current_node.relaxation_state = node_checkpoint
+            save_checkpoint(
+                f"Saved node depth {current_node.depth} after CG iteration "
+                f"{node_checkpoint.iteration}"
+            )
+
         try:
             node_result = solve_node_relaxation(
                 instance=instance,
@@ -2609,24 +3157,25 @@ def branch_and_price(
                 deadline=deadline,
                 progress=progress,
                 node_label=f"node depth {depth}",
+                resume_state=current_node.relaxation_state,
+                checkpoint_callback=save_node_relaxation_checkpoint,
             )
         except TimeoutError:
-            heapq.heappush(
-                active_nodes,
-                (lower_bound_hint, depth, next(sequence_counter), branch_state),
-            )
             if progress is not None:
                 progress.emit("Time limit reached while processing the current node", force=True)
             status = "TIME_LIMIT"
+            save_checkpoint(f"Time limit reached while processing node depth {depth}")
             break
 
         nodes_processed += 1
         if node_result is None:
+            current_node = None
             maybe_record_trace(
                 "bound_update",
                 note="Pruned infeasible node",
                 node_depth=depth,
             )
+            save_checkpoint(f"Pruned infeasible node at depth {depth}")
             continue
         if root_lp_objective is None:
             root_lp_objective = node_result.lower_bound
@@ -2642,15 +3191,18 @@ def branch_and_price(
                 note="Root relaxation closed",
                 node_depth=depth,
             )
+            save_checkpoint("Closed root relaxation")
 
         node_lb = node_result.lower_bound
         if incumbent_obj is not None and node_lb >= incumbent_obj - INTEGRALITY_TOL:
             nodes_pruned += 1
+            current_node = None
             maybe_record_trace(
                 "bound_update",
                 note="Pruned processed node by incumbent cutoff",
                 node_depth=depth,
             )
+            save_checkpoint(f"Pruned processed node at depth {depth} by incumbent cutoff")
             continue
 
         heuristic_obj: float | None = None
@@ -2666,16 +3218,15 @@ def branch_and_price(
                     progress_label=f"restricted-master heuristic at node depth {depth}",
                 )
             except TimeoutError:
-                heapq.heappush(
-                    active_nodes,
-                    (node_lb, depth, next(sequence_counter), branch_state),
-                )
                 if progress is not None:
                     progress.emit(
                         "Time limit reached while solving the restricted-master heuristic",
                         force=True,
                     )
                 status = "TIME_LIMIT"
+                save_checkpoint(
+                    f"Time limit reached during restricted-master heuristic at depth {depth}"
+                )
                 break
             if heuristic_solution is not None:
                 heuristic_obj, heuristic_routes = heuristic_solution
@@ -2694,6 +3245,7 @@ def branch_and_price(
                         note="Improved incumbent from restricted master",
                         node_depth=depth,
                     )
+                    save_checkpoint(f"Updated incumbent from restricted master at depth {depth}")
 
         if is_integral_solution(node_result.route_values):
             selected_routes = [
@@ -2715,13 +3267,22 @@ def branch_and_price(
                     note="Found integral node solution",
                     node_depth=depth,
                 )
+                save_checkpoint(f"Updated incumbent from integral node at depth {depth}")
+            current_node = None
+            save_checkpoint(f"Fathomed integral node at depth {depth}")
             continue
 
         if heuristic_obj is not None and abs(heuristic_obj - node_lb) <= 1e-5:
+            current_node = None
+            save_checkpoint(
+                f"Fathomed node depth {depth} because heuristic matched the LP bound"
+            )
             continue
 
         branch_ctx = build_branch_context(branch_state, instance, vehicle_types)
         if branch_ctx is None:
+            current_node = None
+            save_checkpoint(f"Skipped inconsistent branch context at depth {depth}")
             continue
 
         child_states: list[BranchState] = []
@@ -2833,14 +3394,16 @@ def branch_and_price(
                 continue
             heapq.heappush(
                 active_nodes,
-                (node_lb, depth + 1, next(sequence_counter), child_state),
+                (node_lb, depth + 1, allocate_sequence_id(), child_state),
             )
 
+        current_node = None
         maybe_record_trace(
             "bound_update",
             note="Updated global bound after branching",
             node_depth=depth,
         )
+        save_checkpoint(f"Branched node at depth {depth}")
 
         best_bound = min(bound for bound, *_ in active_nodes) if active_nodes else node_lb
         if incumbent_obj is not None and mip_gap is not None:
@@ -2859,20 +3422,27 @@ def branch_and_price(
                     note="Reached requested relative gap target",
                     node_depth=depth,
                 )
+                save_checkpoint("Reached requested relative gap target")
                 break
 
     if status == "UNKNOWN":
-        if active_nodes:
+        if current_node is not None or active_nodes:
             status = "TIME_LIMIT" if deadline is not None and remaining_time(deadline) <= 0 else "NODE_LIMIT"
         elif incumbent_obj is None:
             status = "INFEASIBLE"
         else:
             status = "OPTIMAL"
 
-    if root_lp_objective is None and nodes_processed == 0:
+    pending_bounds: list[float] = []
+    if current_node is not None:
+        pending_bounds.append(current_node.lower_bound_hint)
+    if active_nodes:
+        pending_bounds.append(min(bound for bound, *_ in active_nodes))
+
+    if root_lp_objective is None and nodes_processed == 0 and not pending_bounds:
         best_bound = None
-    elif active_nodes:
-        best_bound = min(bound for bound, *_ in active_nodes)
+    elif pending_bounds:
+        best_bound = min(pending_bounds)
     elif incumbent_obj is not None:
         best_bound = incumbent_obj
     else:
@@ -2888,9 +3458,11 @@ def branch_and_price(
             nodes_processed=nodes_processed,
             nodes_pruned=nodes_pruned,
             global_columns=len(route_pool),
-            queue_size=len(active_nodes),
+            queue_size=pending_node_count(),
             note="Branch-and-price finished",
         )
+
+    save_checkpoint(f"Branch-and-price exited with status {status}")
 
     return BranchAndPriceResult(
         status=status,
@@ -2920,10 +3492,13 @@ def solve_model(
     heuristic_time_limit: float | None = HEURISTIC_MASTER_TIME_LIMIT,
     progress: ProgressTracker | None = None,
     trace_logger: ObjectiveTraceLogger | None = None,
+    checkpoint_manager: CheckpointManager | None = None,
+    resume_from: Path | None = None,
 ) -> BranchAndPriceResult:
     instance = load_instance(workbook_path)
     result = branch_and_price(
         instance=instance,
+        workbook_path=workbook_path,
         time_limit=time_limit,
         mip_gap=mip_gap,
         max_cg_iterations=max_cg_iterations,
@@ -2936,6 +3511,8 @@ def solve_model(
         heuristic_time_limit=heuristic_time_limit,
         progress=progress,
         trace_logger=trace_logger,
+        checkpoint_manager=checkpoint_manager,
+        resume_from=resume_from,
     )
 
     print(f"Status: {result.status}")
@@ -3118,6 +3695,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable writing the objective trace CSV.",
     )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON checkpoint path. When set, save resumable branch-and-price "
+            "state after each completed CG iteration and major tree updates. "
+            "Default: disabled unless --resume-from is provided."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help=(
+            "Resume branch-and-price from a previously saved checkpoint JSON file. "
+            "If --checkpoint-path is omitted, the resumed run keeps writing to this file."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -3142,6 +3738,8 @@ def main() -> None:
         if args.no_objective_trace
         else (args.objective_trace or default_objective_trace_path(args.workbook))
     )
+    checkpoint_path = args.checkpoint_path or args.resume_from
+    checkpoint_manager = CheckpointManager(checkpoint_path)
     trace_logger = ObjectiveTraceLogger(objective_trace_path, args.workbook)
     previous_handlers = install_interrupt_handlers()
 
@@ -3153,6 +3751,8 @@ def main() -> None:
                 status="RUNNING",
                 note=f"Workbook: {args.workbook}",
             )
+        if checkpoint_manager.path is not None:
+            print(f"Checkpoint path: {checkpoint_manager.path}")
         solve_model(
             workbook_path=args.workbook,
             time_limit=args.time_limit,
@@ -3167,6 +3767,8 @@ def main() -> None:
             heuristic_time_limit=heuristic_time_limit,
             progress=progress,
             trace_logger=trace_logger,
+            checkpoint_manager=checkpoint_manager,
+            resume_from=args.resume_from,
         )
     except KeyboardInterrupt:
         interrupt_note = "Interrupted by user"
@@ -3179,6 +3781,8 @@ def main() -> None:
                 note=interrupt_note,
             )
             print(f"\n{interrupt_note}. Partial objective trace saved to {trace_logger.path}")
+        if checkpoint_manager.path is not None:
+            print(f"{interrupt_note}. Latest checkpoint retained at {checkpoint_manager.path}")
         raise SystemExit(130) from None
     finally:
         restore_interrupt_handlers(previous_handlers)
