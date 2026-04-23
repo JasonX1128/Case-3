@@ -79,7 +79,6 @@ class Instance:
     cost_params: dict[str, float]
     depot_open_min: float
     depot_close_min: float
-    big_m: float
 
 
 @dataclass
@@ -651,9 +650,6 @@ def load_instance(workbook_path: Path) -> Instance:
     ws_dist = wb["Distance Matrix (miles)"]
     ws_time = wb["Travel Time Matrix (min)"]
     ws_cost = wb["Cost Parameters"]
-    ws_solver = wb["Solver Setup"]
-
-    big_m = float(ws_solver["B9"].value)
 
     stops: dict[int, StopData] = {}
     for row in range(2, ws_stops.max_row + 1):
@@ -714,7 +710,6 @@ def load_instance(workbook_path: Path) -> Instance:
         cost_params=cost_params,
         depot_open_min=depot_open_min,
         depot_close_min=depot_close_min,
-        big_m=big_m,
     )
 
 
