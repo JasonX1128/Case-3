@@ -195,6 +195,14 @@ class ArcFlowSolveResult:
     vehicle_solutions: list[ArcFlowVehicleSolution]
     fixed_arc_count: int
     symmetry_group_count: int
+    bound_plot_path: Path | None = None
+
+
+@dataclass
+class MIPBoundPoint:
+    elapsed_seconds: float
+    upper_bound: float | None
+    lower_bound: float | None
 
 
 @dataclass
@@ -258,6 +266,98 @@ class ProgressTracker:
         elapsed = now - self.start_time
         print(f"[{elapsed:7.1f}s] {message}", flush=True)
         self.last_emit = now
+
+
+class MIPBoundLogger:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.points: list[MIPBoundPoint] = []
+        self._last_upper_bound: float | None | object = _MISSING
+        self._last_lower_bound: float | None | object = _MISSING
+
+    @staticmethod
+    def _normalize_bound(value: float) -> float | None:
+        if not math.isfinite(value):
+            return None
+        if abs(value) >= GRB.INFINITY / 2:
+            return None
+        return float(value)
+
+    def record(self, elapsed_seconds: float, upper_bound: float | None, lower_bound: float | None) -> None:
+        if (
+            self._last_upper_bound is not _MISSING
+            and self._last_lower_bound is not _MISSING
+            and optional_float_changed(self._last_upper_bound, upper_bound) is False
+            and optional_float_changed(self._last_lower_bound, lower_bound) is False
+        ):
+            return
+        self.points.append(
+            MIPBoundPoint(
+                elapsed_seconds=max(elapsed_seconds, 0.0),
+                upper_bound=upper_bound,
+                lower_bound=lower_bound,
+            )
+        )
+        self._last_upper_bound = upper_bound
+        self._last_lower_bound = lower_bound
+
+    def record_callback(self, cb_model: gp.Model, where: int) -> None:
+        code_map = {
+            GRB.Callback.MIP: (GRB.Callback.MIP_OBJBST, GRB.Callback.MIP_OBJBND),
+            GRB.Callback.MIPSOL: (GRB.Callback.MIPSOL_OBJBST, GRB.Callback.MIPSOL_OBJBND),
+            GRB.Callback.MIPNODE: (GRB.Callback.MIPNODE_OBJBST, GRB.Callback.MIPNODE_OBJBND),
+        }
+        if where not in code_map:
+            return
+        upper_code, lower_code = code_map[where]
+        elapsed_seconds = cb_model.cbGet(GRB.Callback.RUNTIME)
+        upper_bound = self._normalize_bound(cb_model.cbGet(upper_code))
+        lower_bound = self._normalize_bound(cb_model.cbGet(lower_code))
+        self.record(elapsed_seconds, upper_bound, lower_bound)
+
+    def record_final_model_state(self, model: gp.Model) -> None:
+        upper_bound = model.ObjVal if model.SolCount > 0 else None
+        try:
+            lower_bound = self._normalize_bound(model.ObjBound)
+        except gp.GurobiError:
+            lower_bound = None
+        self.record(model.Runtime, upper_bound, lower_bound)
+
+    def save_plot(self, title: str) -> Path:
+        if not self.points:
+            raise ValueError("No MIP bound history was recorded.")
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise RuntimeError(
+                "Saving the MIP bound plot requires matplotlib to be installed."
+            ) from exc
+
+        times = [point.elapsed_seconds for point in self.points]
+        upper_bounds = [
+            math.nan if point.upper_bound is None else point.upper_bound for point in self.points
+        ]
+        lower_bounds = [
+            math.nan if point.lower_bound is None else point.lower_bound for point in self.points
+        ]
+
+        figure, axis = plt.subplots(figsize=(9, 5))
+        axis.step(times, lower_bounds, where="post", label="Lower Bound", linewidth=2.0)
+        axis.step(times, upper_bounds, where="post", label="Upper Bound", linewidth=2.0)
+        axis.set_xlabel("Elapsed Seconds")
+        axis.set_ylabel("Objective Value")
+        axis.set_title(title)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(self.path, dpi=150)
+        plt.close(figure)
+        return self.path
 
 
 class ObjectiveTraceLogger:
@@ -839,8 +939,9 @@ def optimize_with_heartbeat(
     model: gp.Model,
     progress: ProgressTracker | None,
     label: str,
+    bound_logger: MIPBoundLogger | None = None,
 ) -> None:
-    if progress is None or not progress.enabled:
+    if (progress is None or not progress.enabled) and bound_logger is None:
         model.optimize()
         return
 
@@ -851,10 +952,17 @@ def optimize_with_heartbeat(
         GRB.Callback.MIPNODE,
         GRB.Callback.MIPSOL,
     }
-    last_runtime_report = [-progress.interval_seconds]
+    heartbeat_interval = (
+        progress.interval_seconds if progress is not None and progress.enabled else 0.0
+    )
+    last_runtime_report = [-heartbeat_interval]
 
     def callback(cb_model: gp.Model, where: int) -> None:
+        if bound_logger is not None:
+            bound_logger.record_callback(cb_model, where)
         if where not in active_callback_points:
+            return
+        if progress is None or not progress.enabled:
             return
         runtime = cb_model.cbGet(GRB.Callback.RUNTIME)
         if runtime < progress.interval_seconds:
@@ -922,6 +1030,10 @@ def optional_float_changed(previous: float | None, current: float | None, tol: f
 def default_objective_trace_path(workbook_path: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return workbook_path.with_name(f"{workbook_path.stem}_objective_trace_{timestamp}.csv")
+
+
+def default_mip_bound_plot_path(workbook_path: Path, run_timestamp: str) -> Path:
+    return workbook_path.parent / "plots" / f"{workbook_path.stem}_mip_bounds_{run_timestamp}.png"
 
 
 def install_interrupt_handlers() -> dict[int, Any]:
@@ -1815,6 +1927,9 @@ def solve_arc_flow_model(
     progress: ProgressTracker | None = None,
     trace_logger: ObjectiveTraceLogger | None = None,
 ) -> ArcFlowSolveResult:
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bound_plot_path = default_mip_bound_plot_path(workbook_path, run_timestamp)
+    bound_logger = MIPBoundLogger(bound_plot_path)
     instance = load_instance(workbook_path)
     model, data = build_arc_flow_model(instance)
 
@@ -1823,7 +1938,13 @@ def solve_arc_flow_model(
     if mip_gap is not None:
         model.Params.MIPGap = mip_gap
 
-    optimize_with_heartbeat(model, progress=progress, label="arc-flow master MIP")
+    optimize_with_heartbeat(
+        model,
+        progress=progress,
+        label="arc-flow master MIP",
+        bound_logger=bound_logger,
+    )
+    bound_logger.record_final_model_state(model)
     status = gurobi_status_name(model.Status)
 
     best_bound: float | None
@@ -1882,6 +2003,7 @@ def solve_arc_flow_model(
         vehicle_solutions=vehicle_solutions,
         fixed_arc_count=data["fixed_arc_count"],
         symmetry_group_count=data["symmetry_group_count"],
+        bound_plot_path=bound_logger.save_plot(f"{workbook_path.stem} MIP Bounds ({status})"),
     )
 
     if trace_logger is not None:
@@ -1898,6 +2020,8 @@ def solve_arc_flow_model(
     print("Formulation: Arc-Flow MIP with Vehicle Symmetry Breaking")
     print(f"Fixed impossible arcs: {result.fixed_arc_count}")
     print(f"Symmetry groups: {result.symmetry_group_count}")
+    if result.bound_plot_path is not None:
+        print(f"MIP bound plot: {result.bound_plot_path}")
     if result.best_bound is not None:
         print(f"Best bound: {result.best_bound:.2f}")
     if result.objective is not None:
