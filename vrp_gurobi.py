@@ -479,12 +479,30 @@ class MIPBoundLogger:
         self.record(elapsed_seconds, upper_bound, lower_bound)
 
     def record_final_model_state(self, model: gp.Model) -> None:
-        upper_bound = model.ObjVal if model.SolCount > 0 else None
+        elapsed_seconds = 0.0
+        try:
+            elapsed_seconds = max(float(model.Runtime), 0.0)
+        except (AttributeError, TypeError, ValueError, gp.GurobiError):
+            elapsed_seconds = 0.0
+
+        sol_count = 0
+        try:
+            sol_count = int(model.SolCount)
+        except (AttributeError, TypeError, ValueError, gp.GurobiError):
+            sol_count = 0
+
+        upper_bound: float | None = None
+        if sol_count > 0:
+            try:
+                upper_bound = self._normalize_bound(model.ObjVal)
+            except (AttributeError, TypeError, ValueError, gp.GurobiError):
+                upper_bound = None
+
         try:
             lower_bound = self._normalize_bound(model.ObjBound)
-        except gp.GurobiError:
+        except (AttributeError, TypeError, ValueError, gp.GurobiError):
             lower_bound = None
-        self.record(model.Runtime, upper_bound, lower_bound)
+        self.record(elapsed_seconds, upper_bound, lower_bound)
 
     def has_points(self) -> bool:
         return bool(self.points)
@@ -500,9 +518,6 @@ class MIPBoundLogger:
         return self.points[-1].lower_bound
 
     def save_plot(self, title: str) -> Path:
-        if not self.points:
-            raise ValueError("No MIP bound history was recorded.")
-
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -514,26 +529,64 @@ class MIPBoundLogger:
                 "Saving the MIP bound plot requires matplotlib to be installed."
             ) from exc
 
-        times = [point.elapsed_seconds for point in self.points]
-        upper_bounds = [
-            math.nan if point.upper_bound is None else point.upper_bound for point in self.points
-        ]
-        lower_bounds = [
-            math.nan if point.lower_bound is None else point.lower_bound for point in self.points
-        ]
-
         figure, axis = plt.subplots(figsize=(9, 5))
-        axis.step(times, lower_bounds, where="post", label="Lower Bound", linewidth=2.0)
-        axis.step(times, upper_bounds, where="post", label="Upper Bound", linewidth=2.0)
+        has_finite_upper_bounds = any(point.upper_bound is not None for point in self.points)
+        has_finite_lower_bounds = any(point.lower_bound is not None for point in self.points)
+
+        if self.points:
+            times = [point.elapsed_seconds for point in self.points]
+            upper_bounds = [
+                math.nan if point.upper_bound is None else point.upper_bound for point in self.points
+            ]
+            lower_bounds = [
+                math.nan if point.lower_bound is None else point.lower_bound for point in self.points
+            ]
+            if has_finite_lower_bounds:
+                axis.step(times, lower_bounds, where="post", label="Lower Bound", linewidth=2.0)
+            if has_finite_upper_bounds:
+                axis.step(times, upper_bounds, where="post", label="Upper Bound", linewidth=2.0)
+        else:
+            axis.set_xlim(0.0, 1.0)
+
         axis.set_xlabel("Elapsed Seconds")
         axis.set_ylabel("Objective Value")
         axis.set_title(title)
         axis.grid(True, alpha=0.3)
-        axis.legend()
+        if has_finite_upper_bounds or has_finite_lower_bounds:
+            axis.legend()
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No finite MIP bounds were available before the solve stopped.",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+                fontsize=10,
+            )
         figure.tight_layout()
         figure.savefig(self.path, dpi=150)
         plt.close(figure)
         return self.path
+
+
+def capture_mip_bound_snapshot(model: gp.Model, bound_logger: MIPBoundLogger) -> None:
+    try:
+        bound_logger.record_final_model_state(model)
+    except Exception:
+        return
+
+
+def save_mip_bound_plot_snapshot(
+    workbook_path: Path,
+    bound_logger: MIPBoundLogger,
+    *,
+    status_label: str,
+) -> Path | None:
+    try:
+        return bound_logger.save_plot(f"{workbook_path.stem} MIP Bounds ({status_label})")
+    except Exception:
+        return None
 
 
 class MIPPersistenceManager:
@@ -2715,213 +2768,229 @@ def solve_arc_flow_model(
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     bound_plot_path = default_mip_bound_plot_path(workbook_path, run_timestamp)
     bound_logger = MIPBoundLogger(bound_plot_path)
-    instance = load_instance(workbook_path)
-    model, data = build_arc_flow_model(instance)
+    saved_bound_plot_path: Path | None = None
     loaded_start_path: Path | None = None
-
-    if mip_profile is not None:
-        print(f"Arc-flow MIP profile: {mip_profile.name}")
-        print(f"  {mip_profile.description}")
-        apply_arc_flow_mip_profile(model, mip_profile, skip_params=skip_mip_profile_params)
-    if time_limit is not None:
-        model.Params.TimeLimit = time_limit
-    if mip_gap is not None:
-        model.Params.MIPGap = mip_gap
-    if persistence_manager is not None:
-        loaded_start_path = persistence_manager.load_start(model, workbook_path)
+    model: gp.Model | None = None
 
     try:
-        optimize_with_heartbeat(
-            model,
-            progress=progress,
-            label="arc-flow master MIP",
-            bound_logger=bound_logger,
-        )
-        bound_logger.record_final_model_state(model)
-    except KeyboardInterrupt:
-        interrupted_objective = bound_logger.latest_upper_bound()
-        interrupted_best_bound = bound_logger.latest_lower_bound()
-        interrupted_gap = relative_gap(interrupted_objective, interrupted_best_bound)
-        partial_plot_path: Path | None = None
-        if bound_logger.has_points():
-            try:
-                partial_plot_path = bound_logger.save_plot(
-                    f"{workbook_path.stem} MIP Bounds (INTERRUPTED)"
+        instance = load_instance(workbook_path)
+        model, data = build_arc_flow_model(instance)
+
+        if mip_profile is not None:
+            print(f"Arc-flow MIP profile: {mip_profile.name}")
+            print(f"  {mip_profile.description}")
+            apply_arc_flow_mip_profile(model, mip_profile, skip_params=skip_mip_profile_params)
+        if time_limit is not None:
+            model.Params.TimeLimit = time_limit
+        if mip_gap is not None:
+            model.Params.MIPGap = mip_gap
+        if persistence_manager is not None:
+            loaded_start_path = persistence_manager.load_start(model, workbook_path)
+
+        try:
+            optimize_with_heartbeat(
+                model,
+                progress=progress,
+                label="arc-flow master MIP",
+                bound_logger=bound_logger,
+            )
+            capture_mip_bound_snapshot(model, bound_logger)
+        except KeyboardInterrupt:
+            capture_mip_bound_snapshot(model, bound_logger)
+            interrupted_objective = bound_logger.latest_upper_bound()
+            interrupted_best_bound = bound_logger.latest_lower_bound()
+            interrupted_gap = relative_gap(interrupted_objective, interrupted_best_bound)
+            saved_bound_plot_path = save_mip_bound_plot_snapshot(
+                workbook_path,
+                bound_logger,
+                status_label="INTERRUPTED",
+            )
+            resume_solution_path: Path | None = None
+            if persistence_manager is not None:
+                resume_solution_path = persistence_manager.finalize_run(
+                    workbook_path=workbook_path,
+                    status="INTERRUPTED",
+                    loaded_start_path=loaded_start_path,
+                    objective=interrupted_objective,
+                    best_bound=interrupted_best_bound,
+                    gap=interrupted_gap,
+                    note="Arc-flow MIP interrupted",
                 )
-            except Exception:
-                partial_plot_path = None
+            if saved_bound_plot_path is not None:
+                print(f"\nPartial MIP bound plot saved to {saved_bound_plot_path}")
+            if resume_solution_path is not None:
+                print(f"Saved resumable MIP start to {resume_solution_path}")
+            raise
+
+        status = gurobi_status_name(model.Status)
+
+        best_bound: float | None
+        try:
+            best_bound = model.ObjBound
+        except gp.GurobiError:
+            best_bound = None
+
+        objective = model.ObjVal if model.SolCount > 0 else None
+        gap = relative_gap(objective, best_bound)
+
+        vehicle_solutions: list[ArcFlowVehicleSolution] = []
+        if model.SolCount > 0:
+            for vehicle_id in data["vehicle_ids"]:
+                if data["use_vehicle"][vehicle_id].X < 0.5:
+                    continue
+                vehicle = instance.vehicles[vehicle_id]
+                route = extract_arc_flow_route(data, vehicle_id)
+                served_stops = [stop_id for stop_id in route if stop_id != DEPOT_NODE]
+                service_start_min = {
+                    stop_id: data["service_start_min"][stop_id].X for stop_id in served_stops
+                }
+                late_min = {stop_id: data["late_min"][stop_id].X for stop_id in served_stops}
+                lunch_break_start_min = (
+                    data["lunch_start_min"][vehicle_id].X
+                    if data["lunch_required"][vehicle_id].X > 0.5
+                    else None
+                )
+                distance_cost = data["distance_cost_expr"][vehicle_id].getValue()
+                billed_hours = int(round(data["billed_hours"][vehicle_id].X))
+                route_cost = (
+                    vehicle.fixed_daily_cost
+                    + distance_cost
+                    + billed_hours * instance.cost_params["Driver_Hourly_Wage"]
+                    + sum(late_min.values()) / 60.0 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+                )
+                vehicle_solutions.append(
+                    ArcFlowVehicleSolution(
+                        vehicle_id=vehicle_id,
+                        vehicle=vehicle,
+                        route=route,
+                        load_kg=sum(instance.stops[stop_id].demand_kg for stop_id in served_stops),
+                        depart_min=data["depart_min"][vehicle_id].X,
+                        return_min=data["return_min"][vehicle_id].X,
+                        drive_min=data["drive_min_expr"][vehicle_id].getValue(),
+                        service_min=data["service_min_expr"][vehicle_id].getValue(),
+                        active_min=data["active_min_expr"][vehicle_id].getValue(),
+                        billed_hours=billed_hours,
+                        distance_cost=distance_cost,
+                        route_cost=route_cost,
+                        service_start_min=service_start_min,
+                        late_min=late_min,
+                        lunch_break_start_min=lunch_break_start_min,
+                    )
+                )
+
+        saved_bound_plot_path = bound_logger.save_plot(f"{workbook_path.stem} MIP Bounds ({status})")
+        result = ArcFlowSolveResult(
+            status=status,
+            objective=objective,
+            best_bound=best_bound,
+            gap=gap,
+            vehicle_solutions=vehicle_solutions,
+            fixed_arc_count=data["fixed_arc_count"],
+            symmetry_group_count=data["symmetry_group_count"],
+            bound_plot_path=saved_bound_plot_path,
+        )
+
         resume_solution_path: Path | None = None
         if persistence_manager is not None:
             resume_solution_path = persistence_manager.finalize_run(
                 workbook_path=workbook_path,
-                status="INTERRUPTED",
+                status=result.status,
                 loaded_start_path=loaded_start_path,
-                objective=interrupted_objective,
-                best_bound=interrupted_best_bound,
-                gap=interrupted_gap,
-                note="Arc-flow MIP interrupted",
+                objective=result.objective,
+                best_bound=result.best_bound,
+                gap=result.gap,
+                note="Arc-flow MIP finished",
             )
-        if partial_plot_path is not None:
-            print(f"\nPartial MIP bound plot saved to {partial_plot_path}")
+
+        if trace_logger is not None:
+            trace_logger.record(
+                event="solve_end",
+                status=result.status,
+                incumbent_objective=result.objective,
+                best_bound=result.best_bound,
+                relative_gap=result.gap,
+                note="Arc-flow MIP finished",
+            )
+
+        print(f"Status: {result.status}")
+        print("Formulation: Arc-Flow MIP with Vehicle Symmetry Breaking")
+        print(f"Fixed impossible arcs: {result.fixed_arc_count}")
+        print(f"Symmetry groups: {result.symmetry_group_count}")
+        if loaded_start_path is not None:
+            print(f"Loaded saved MIP start: {loaded_start_path}")
+        if persistence_manager is not None:
+            print(f"MIP persistence dir: {persistence_manager.path}")
         if resume_solution_path is not None:
-            print(f"Saved resumable MIP start to {resume_solution_path}")
-        raise
-    status = gurobi_status_name(model.Status)
-
-    best_bound: float | None
-    try:
-        best_bound = model.ObjBound
-    except gp.GurobiError:
-        best_bound = None
-
-    objective = model.ObjVal if model.SolCount > 0 else None
-    gap = relative_gap(objective, best_bound)
-
-    vehicle_solutions: list[ArcFlowVehicleSolution] = []
-    if model.SolCount > 0:
-        for vehicle_id in data["vehicle_ids"]:
-            if data["use_vehicle"][vehicle_id].X < 0.5:
-                continue
-            vehicle = instance.vehicles[vehicle_id]
-            route = extract_arc_flow_route(data, vehicle_id)
-            served_stops = [stop_id for stop_id in route if stop_id != DEPOT_NODE]
-            service_start_min = {
-                stop_id: data["service_start_min"][stop_id].X for stop_id in served_stops
-            }
-            late_min = {stop_id: data["late_min"][stop_id].X for stop_id in served_stops}
-            lunch_break_start_min = (
-                data["lunch_start_min"][vehicle_id].X
-                if data["lunch_required"][vehicle_id].X > 0.5
-                else None
-            )
-            distance_cost = data["distance_cost_expr"][vehicle_id].getValue()
-            billed_hours = int(round(data["billed_hours"][vehicle_id].X))
-            route_cost = (
-                vehicle.fixed_daily_cost
-                + distance_cost
-                + billed_hours * instance.cost_params["Driver_Hourly_Wage"]
-                + sum(late_min.values()) / 60.0 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
-            )
-            vehicle_solutions.append(
-                ArcFlowVehicleSolution(
-                    vehicle_id=vehicle_id,
-                    vehicle=vehicle,
-                    route=route,
-                    load_kg=sum(instance.stops[stop_id].demand_kg for stop_id in served_stops),
-                    depart_min=data["depart_min"][vehicle_id].X,
-                    return_min=data["return_min"][vehicle_id].X,
-                    drive_min=data["drive_min_expr"][vehicle_id].getValue(),
-                    service_min=data["service_min_expr"][vehicle_id].getValue(),
-                    active_min=data["active_min_expr"][vehicle_id].getValue(),
-                    billed_hours=billed_hours,
-                    distance_cost=distance_cost,
-                    route_cost=route_cost,
-                    service_start_min=service_start_min,
-                    late_min=late_min,
-                    lunch_break_start_min=lunch_break_start_min,
-                )
-            )
-
-    result = ArcFlowSolveResult(
-        status=status,
-        objective=objective,
-        best_bound=best_bound,
-        gap=gap,
-        vehicle_solutions=vehicle_solutions,
-        fixed_arc_count=data["fixed_arc_count"],
-        symmetry_group_count=data["symmetry_group_count"],
-        bound_plot_path=bound_logger.save_plot(f"{workbook_path.stem} MIP Bounds ({status})"),
-    )
-
-    resume_solution_path: Path | None = None
-    if persistence_manager is not None:
-        resume_solution_path = persistence_manager.finalize_run(
-            workbook_path=workbook_path,
-            status=result.status,
-            loaded_start_path=loaded_start_path,
-            objective=result.objective,
-            best_bound=result.best_bound,
-            gap=result.gap,
-            note="Arc-flow MIP finished",
-        )
-
-    if trace_logger is not None:
-        trace_logger.record(
-            event="solve_end",
-            status=result.status,
-            incumbent_objective=result.objective,
-            best_bound=result.best_bound,
-            relative_gap=result.gap,
-            note="Arc-flow MIP finished",
-        )
-
-    print(f"Status: {result.status}")
-    print("Formulation: Arc-Flow MIP with Vehicle Symmetry Breaking")
-    print(f"Fixed impossible arcs: {result.fixed_arc_count}")
-    print(f"Symmetry groups: {result.symmetry_group_count}")
-    if loaded_start_path is not None:
-        print(f"Loaded saved MIP start: {loaded_start_path}")
-    if persistence_manager is not None:
-        print(f"MIP persistence dir: {persistence_manager.path}")
-    if resume_solution_path is not None:
-        print(f"Saved resumable MIP start: {resume_solution_path}")
-    if result.bound_plot_path is not None:
-        print(f"MIP bound plot: {result.bound_plot_path}")
-    if result.best_bound is not None:
-        print(f"Best bound: {result.best_bound:.2f}")
-    if result.objective is not None:
-        print(f"Objective value: {result.objective:.2f}")
-    if result.gap is not None:
-        print(f"Relative gap: {100.0 * result.gap:.2f}%")
-    print()
-
-    if not result.vehicle_solutions:
-        print("No feasible solution found.")
-        return result
-
-    for vehicle_solution in result.vehicle_solutions:
-        print(f"Vehicle {vehicle_solution.vehicle_id} ({vehicle_solution.vehicle.vehicle_type})")
-        print(
-            "  "
-            f"Depart {minutes_to_clock(vehicle_solution.depart_min)}, "
-            f"Return {minutes_to_clock(vehicle_solution.return_min)}, "
-            f"Load {vehicle_solution.load_kg:.0f} / {vehicle_solution.vehicle.capacity_kg:.0f} kg"
-        )
-        print(
-            "  "
-            f"Active {vehicle_solution.active_min:.1f} min, Drive {vehicle_solution.drive_min:.1f} min, "
-            f"Service {vehicle_solution.service_min:.1f} min, Billed {vehicle_solution.billed_hours} h"
-        )
-        if vehicle_solution.lunch_break_start_min is not None:
-            lunch_end = vehicle_solution.lunch_break_start_min + MIDDAY_LUNCH_BREAK_RULE.duration_min
-            print(
-                "  "
-                f"Lunch break {minutes_to_clock(vehicle_solution.lunch_break_start_min)}-"
-                f"{minutes_to_clock(lunch_end)}"
-            )
-        print(
-            "  "
-            f"Distance cost {vehicle_solution.distance_cost:.2f}, "
-            f"Route cost {vehicle_solution.route_cost:.2f}"
-        )
-        print(
-            "  Route: "
-            + " -> ".join(
-                "Depot" if node == DEPOT_NODE else f"Stop {node}"
-                for node in vehicle_solution.route
-            )
-        )
-        for stop_id in vehicle_solution.route:
-            if stop_id == DEPOT_NODE:
-                continue
-            print(
-                "    "
-                f"Stop {stop_id}: start {minutes_to_clock(vehicle_solution.service_start_min[stop_id])}, "
-                f"late {vehicle_solution.late_min[stop_id]:.1f} min"
-            )
+            print(f"Saved resumable MIP start: {resume_solution_path}")
+        if result.bound_plot_path is not None:
+            print(f"MIP bound plot: {result.bound_plot_path}")
+        if result.best_bound is not None:
+            print(f"Best bound: {result.best_bound:.2f}")
+        if result.objective is not None:
+            print(f"Objective value: {result.objective:.2f}")
+        if result.gap is not None:
+            print(f"Relative gap: {100.0 * result.gap:.2f}%")
         print()
 
-    return result
+        if not result.vehicle_solutions:
+            print("No feasible solution found.")
+            return result
+
+        for vehicle_solution in result.vehicle_solutions:
+            print(f"Vehicle {vehicle_solution.vehicle_id} ({vehicle_solution.vehicle.vehicle_type})")
+            print(
+                "  "
+                f"Depart {minutes_to_clock(vehicle_solution.depart_min)}, "
+                f"Return {minutes_to_clock(vehicle_solution.return_min)}, "
+                f"Load {vehicle_solution.load_kg:.0f} / {vehicle_solution.vehicle.capacity_kg:.0f} kg"
+            )
+            print(
+                "  "
+                f"Active {vehicle_solution.active_min:.1f} min, Drive {vehicle_solution.drive_min:.1f} min, "
+                f"Service {vehicle_solution.service_min:.1f} min, Billed {vehicle_solution.billed_hours} h"
+            )
+            if vehicle_solution.lunch_break_start_min is not None:
+                lunch_end = vehicle_solution.lunch_break_start_min + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                print(
+                    "  "
+                    f"Lunch break {minutes_to_clock(vehicle_solution.lunch_break_start_min)}-"
+                    f"{minutes_to_clock(lunch_end)}"
+                )
+            print(
+                "  "
+                f"Distance cost {vehicle_solution.distance_cost:.2f}, "
+                f"Route cost {vehicle_solution.route_cost:.2f}"
+            )
+            print(
+                "  Route: "
+                + " -> ".join(
+                    "Depot" if node == DEPOT_NODE else f"Stop {node}"
+                    for node in vehicle_solution.route
+                )
+            )
+            for stop_id in vehicle_solution.route:
+                if stop_id == DEPOT_NODE:
+                    continue
+                print(
+                    "    "
+                    f"Stop {stop_id}: start {minutes_to_clock(vehicle_solution.service_start_min[stop_id])}, "
+                    f"late {vehicle_solution.late_min[stop_id]:.1f} min"
+                )
+            print()
+
+        return result
+    except BaseException as exc:
+        if saved_bound_plot_path is None:
+            if model is not None:
+                capture_mip_bound_snapshot(model, bound_logger)
+            saved_bound_plot_path = save_mip_bound_plot_snapshot(
+                workbook_path,
+                bound_logger,
+                status_label=("INTERRUPTED" if isinstance(exc, KeyboardInterrupt) else "ABORTED"),
+            )
+            if saved_bound_plot_path is not None and isinstance(exc, KeyboardInterrupt):
+                print(f"\nPartial MIP bound plot saved to {saved_bound_plot_path}")
+        raise
 
 
 def best_stop_insertion(
