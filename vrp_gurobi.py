@@ -30,6 +30,7 @@ ARTIFICIAL_COVER_PENALTY = 1_000_000.0
 INITIAL_ACTIVE_COVER_CANDIDATES_PER_STOP = 3
 INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE = 12
 INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
+DEFAULT_MIP_FORMULATION_VERSION = 3
 
 # Optional fallback WLS credentials for hosted environments like Google Colab.
 # Prefer storing secrets in a .env file beside this script:
@@ -405,6 +406,10 @@ class MIPPersistenceManager:
         for candidate in self._autosave_solution_paths():
             candidate.unlink(missing_ok=True)
 
+    def _clear_saved_starts(self) -> None:
+        self._cleanup_autosave_files()
+        self.resume_solution_path.unlink(missing_ok=True)
+
     def _read_state(self) -> dict[str, Any] | None:
         if not self.state_path.is_file():
             return None
@@ -432,6 +437,7 @@ class MIPPersistenceManager:
     ) -> dict[str, Any]:
         return {
             "version": self.VERSION,
+            "formulation_version": DEFAULT_MIP_FORMULATION_VERSION,
             "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "workbook_path": str(workbook_path.resolve()),
             "status": status,
@@ -453,23 +459,33 @@ class MIPPersistenceManager:
         self.ensure_dir()
 
         prior_state = self._read_state()
+        skip_saved_start = False
         if prior_state is not None and prior_state.get("workbook_path") is not None:
             saved_workbook_path = Path(str(prior_state["workbook_path"])).resolve()
             if saved_workbook_path != workbook_path.resolve():
                 print(
                     "Warning: persistence directory was last used with a different workbook; "
-                    "skipping saved MIP start."
+                    "starting fresh in this directory."
                 )
-                self._cleanup_autosave_files()
-                return None
+                self._clear_saved_starts()
+                skip_saved_start = True
+        if prior_state is not None and not skip_saved_start:
+            saved_formulation_version = int(prior_state.get("formulation_version", -1))
+            if saved_formulation_version != DEFAULT_MIP_FORMULATION_VERSION:
+                print(
+                    "Warning: persistence directory contains a saved start from an older "
+                    "default MIP formulation; starting fresh."
+                )
+                self._clear_saved_starts()
+                skip_saved_start = True
 
-        if not self.resume_solution_path.is_file():
+        if not skip_saved_start and not self.resume_solution_path.is_file():
             latest_autosave = self.latest_autosave_solution_path()
             if latest_autosave is not None:
                 shutil.copy2(latest_autosave, self.resume_solution_path)
 
         loaded_start_path: Path | None = None
-        if self.resume_solution_path.is_file():
+        if not skip_saved_start and self.resume_solution_path.is_file():
             try:
                 model.update()
                 model.read(str(self.resume_solution_path))
@@ -1865,6 +1881,17 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         vtype=GRB.INTEGER,
         name="billed_hours",
     )
+    load_after_kg = model.addVars(
+        vehicle_ids,
+        stop_ids,
+        lb=0.0,
+        ub={
+            (vehicle_id, stop_id): instance.vehicles[vehicle_id].capacity_kg
+            for vehicle_id in vehicle_ids
+            for stop_id in stop_ids
+        },
+        name="load_after_kg",
+    )
 
     fixed_arc_count = 0
     for vehicle_id, i, j in arc_keys:
@@ -1918,6 +1945,13 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         )
         for vehicle_id in vehicle_ids
     }
+    served_load_expr = {
+        vehicle_id: gp.quicksum(
+            instance.stops[stop_id].demand_kg * visit[vehicle_id, stop_id]
+            for stop_id in stop_ids
+        )
+        for vehicle_id in vehicle_ids
+    }
     active_min_expr = {
         vehicle_id: return_min[vehicle_id] - depart_min[vehicle_id] for vehicle_id in vehicle_ids
     }
@@ -1963,6 +1997,10 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 * (2 - use_vehicle[prev_vehicle_id] - use_vehicle[next_vehicle_id]),
                 name=f"symmetry_first_customer[{prev_vehicle_id},{next_vehicle_id}]",
             )
+            model.addConstr(
+                served_load_expr[prev_vehicle_id] >= served_load_expr[next_vehicle_id],
+                name=f"symmetry_load[{prev_vehicle_id},{next_vehicle_id}]",
+            )
 
     for vehicle_id in vehicle_ids:
         vehicle = instance.vehicles[vehicle_id]
@@ -1972,6 +2010,10 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         model.addConstr(
             active_min_expr[vehicle_id] >= min_round_trip[vehicle_id] * use_vehicle[vehicle_id],
             name=f"minimum_route_time[{vehicle_id}]",
+        )
+        model.addConstr(
+            active_min_expr[vehicle_id] >= drive_min_expr[vehicle_id] + service_min_expr[vehicle_id],
+            name=f"drive_service_duration_lb[{vehicle_id}]",
         )
 
         for i, j in node_pairs:
@@ -1995,11 +2037,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             )
 
         model.addConstr(
-            gp.quicksum(
-                instance.stops[stop_id].demand_kg * visit[vehicle_id, stop_id]
-                for stop_id in stop_ids
-            )
-            <= vehicle.capacity_kg * use_vehicle[vehicle_id],
+            served_load_expr[vehicle_id] <= vehicle.capacity_kg * use_vehicle[vehicle_id],
             name=f"capacity[{vehicle_id}]",
         )
         model.addConstr(
@@ -2025,6 +2063,15 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         )
 
         for stop_id in stop_ids:
+            stop = instance.stops[stop_id]
+            model.addConstr(
+                load_after_kg[vehicle_id, stop_id] >= stop.demand_kg * visit[vehicle_id, stop_id],
+                name=f"load_lb[{vehicle_id},{stop_id}]",
+            )
+            model.addConstr(
+                load_after_kg[vehicle_id, stop_id] <= vehicle.capacity_kg * visit[vehicle_id, stop_id],
+                name=f"load_ub[{vehicle_id},{stop_id}]",
+            )
             model.addConstr(
                 service_start_min[stop_id]
                 >= vehicle_stop_lb[vehicle_id, stop_id]
@@ -2043,6 +2090,17 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                     >= instance.travel_minutes[DEPOT_NODE, stop_id]
                     - start_arc_m[vehicle_id, stop_id] * (1 - x[vehicle_id, DEPOT_NODE, stop_id]),
                     name=f"time_from_depot[{vehicle_id},{stop_id}]",
+                )
+                model.addConstr(
+                    load_after_kg[vehicle_id, stop_id]
+                    >= stop.demand_kg - vehicle.capacity_kg * (1 - x[vehicle_id, DEPOT_NODE, stop_id]),
+                    name=f"load_from_depot_lb[{vehicle_id},{stop_id}]",
+                )
+                model.addConstr(
+                    load_after_kg[vehicle_id, stop_id]
+                    <= stop.demand_kg
+                    + (vehicle.capacity_kg - stop.demand_kg) * (1 - x[vehicle_id, DEPOT_NODE, stop_id]),
+                    name=f"load_from_depot_ub[{vehicle_id},{stop_id}]",
                 )
             if feasible_arc[vehicle_id, stop_id, DEPOT_NODE]:
                 model.addConstr(
@@ -2063,6 +2121,20 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                     + instance.travel_minutes[stop_id, next_stop]
                     - stop_arc_m[vehicle_id, stop_id, next_stop] * (1 - x[vehicle_id, stop_id, next_stop]),
                     name=f"time_between_stops[{vehicle_id},{stop_id},{next_stop}]",
+                )
+                model.addConstr(
+                    load_after_kg[vehicle_id, next_stop]
+                    >= load_after_kg[vehicle_id, stop_id]
+                    + instance.stops[next_stop].demand_kg
+                    - vehicle.capacity_kg * (1 - x[vehicle_id, stop_id, next_stop]),
+                    name=f"load_progress_lb[{vehicle_id},{stop_id},{next_stop}]",
+                )
+                model.addConstr(
+                    load_after_kg[vehicle_id, next_stop]
+                    <= load_after_kg[vehicle_id, stop_id]
+                    + instance.stops[next_stop].demand_kg
+                    + vehicle.capacity_kg * (1 - x[vehicle_id, stop_id, next_stop]),
+                    name=f"load_progress_ub[{vehicle_id},{stop_id},{next_stop}]",
                 )
 
     objective = gp.quicksum(
@@ -2085,11 +2157,13 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         "service_start_min": service_start_min,
         "late_min": late_min,
         "billed_hours": billed_hours,
+        "load_after_kg": load_after_kg,
         "incoming": incoming,
         "starts": starts,
         "returns": returns,
         "drive_min_expr": drive_min_expr,
         "service_min_expr": service_min_expr,
+        "served_load_expr": served_load_expr,
         "active_min_expr": active_min_expr,
         "distance_cost_expr": distance_cost_expr,
         "fixed_arc_count": fixed_arc_count,
