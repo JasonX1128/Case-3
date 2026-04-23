@@ -1,0 +1,2 @@
+Stop 7 and Stop 8 should be treated as one mall-dock delivery at Redstone Plaza. They need to be handled in the same truck trip, through one check-in with the loading dock, not split across different vehicles at different times.
+Any driver whose route overlaps midday needs a 30-minute lunch break scheduled between 11:30 AM and 1:30 PM. A continuous route through that window with no break is not allowed.

@@ -32,6 +32,69 @@ INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE = 12
 INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
 DEFAULT_MIP_FORMULATION_VERSION = 3
 
+# ============================================================================
+# Hardcoded business rules
+# Keep operational exceptions centralized here so they are easy to spot when
+# scrolling through the file. The workbook remains the source of the baseline
+# data; this section owns the extra "real world" routing rules.
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class RequiredAdjacentStopPairRule:
+    stop_a: int
+    stop_b: int
+    description: str
+
+    @property
+    def ordered_pair(self) -> tuple[int, int]:
+        return tuple(sorted((self.stop_a, self.stop_b)))
+
+    @property
+    def directed_arcs(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        return ((self.stop_a, self.stop_b), (self.stop_b, self.stop_a))
+
+
+@dataclass(frozen=True)
+class MandatoryLunchBreakRule:
+    window_start_min: float
+    window_end_min: float
+    duration_min: float
+    description: str
+
+    @property
+    def latest_start_min(self) -> float:
+        return self.window_end_min - self.duration_min
+
+
+REDSTONE_PLAZA_PAIR_RULES: tuple[RequiredAdjacentStopPairRule, ...] = (
+    RequiredAdjacentStopPairRule(
+        stop_a=7,
+        stop_b=8,
+        description=(
+            "Redstone Plaza mall stores must be handled in one truck trip with an "
+            "immediate 7->8 or 8->7 handoff."
+        ),
+    ),
+)
+
+MIDDAY_LUNCH_BREAK_RULE = MandatoryLunchBreakRule(
+    window_start_min=11.5 * 60.0,
+    window_end_min=13.5 * 60.0,
+    duration_min=30.0,
+    description=(
+        "Any route that overlaps midday must include one 30-minute lunch break "
+        "scheduled between 11:30 and 13:30."
+    ),
+)
+
+REQUIRED_ADJACENT_STOP_PARTNER: dict[int, int] = {
+    stop_id: partner_id
+    for rule in REDSTONE_PLAZA_PAIR_RULES
+    for stop_id, partner_id in ((rule.stop_a, rule.stop_b), (rule.stop_b, rule.stop_a))
+}
+REQUIRED_SAME_ROUTE_PAIRS = frozenset(rule.ordered_pair for rule in REDSTONE_PLAZA_PAIR_RULES)
+
 # Optional fallback WLS credentials for hosted environments like Google Colab.
 # Prefer storing secrets in a .env file beside this script:
 #   GUROBI_WLSACCESSID=...
@@ -111,6 +174,15 @@ class RouteColumn:
     return_min: float
     service_start_min: dict[int, float]
     late_min: dict[int, float]
+    lunch_break_start_min: float | None
+
+
+@dataclass(frozen=True)
+class RouteTimingEvaluation:
+    service_start_min: dict[int, float]
+    late_min: dict[int, float]
+    return_min: float
+    lunch_break_start_min: float | None
 
 
 @dataclass(frozen=True)
@@ -186,6 +258,7 @@ class ArcFlowVehicleSolution:
     route_cost: float
     service_start_min: dict[int, float]
     late_min: dict[int, float]
+    lunch_break_start_min: float | None
 
 
 @dataclass
@@ -247,6 +320,7 @@ class PricingLabel:
     visited_mask: int
     load_kg: float
     time_after_service: float
+    lunch_break_taken: bool
     reduced_cost: float
     nonlabor_reduced_cost: float
     predecessor_idx: int | None
@@ -1667,12 +1741,110 @@ def incremental_labor_cost(
     )
 
 
+def active_business_rule_descriptions() -> list[str]:
+    descriptions = [rule.description for rule in REDSTONE_PLAZA_PAIR_RULES]
+    if MIDDAY_LUNCH_BREAK_RULE is not None:
+        descriptions.append(MIDDAY_LUNCH_BREAK_RULE.description)
+    return descriptions
+
+
+def lunch_break_interval_after(current_time_min: float) -> tuple[float, float] | None:
+    if MIDDAY_LUNCH_BREAK_RULE is None:
+        return None
+    break_start = max(current_time_min, MIDDAY_LUNCH_BREAK_RULE.window_start_min)
+    break_end = break_start + MIDDAY_LUNCH_BREAK_RULE.duration_min
+    if break_end > MIDDAY_LUNCH_BREAK_RULE.window_end_min + 1e-9:
+        return None
+    return break_start, break_end
+
+
+def route_overlaps_interval(
+    route_start_min: float,
+    route_end_min: float,
+    interval_start_min: float,
+    interval_end_min: float,
+) -> bool:
+    return (
+        route_start_min < interval_end_min - 1e-9
+        and route_end_min > interval_start_min + 1e-9
+    )
+
+
+def stop_sequence_respects_required_adjacencies(stop_sequence: tuple[int, ...]) -> bool:
+    stop_positions = {stop_id: idx for idx, stop_id in enumerate(stop_sequence)}
+    for rule in REDSTONE_PLAZA_PAIR_RULES:
+        idx_a = stop_positions.get(rule.stop_a)
+        idx_b = stop_positions.get(rule.stop_b)
+        if (idx_a is None) != (idx_b is None):
+            return False
+        if idx_a is not None and abs(idx_a - idx_b) != 1:
+            return False
+    return True
+
+
+def route_respects_required_adjacencies(route: RouteColumn) -> bool:
+    for rule in REDSTONE_PLAZA_PAIR_RULES:
+        has_a = rule.stop_a in route.stop_set
+        has_b = rule.stop_b in route.stop_set
+        if has_a != has_b:
+            return False
+        if has_a and not any(arc in route.arc_set for arc in rule.directed_arcs):
+            return False
+    return True
+
+
+def simulate_stop_sequence_timing(
+    instance: Instance,
+    start_limit: float,
+    stop_sequence: tuple[int, ...],
+    lunch_break_after_stop_count: int | None,
+) -> RouteTimingEvaluation | None:
+    current_time = start_limit
+    current_node = DEPOT_NODE
+    service_start_min: dict[int, float] = {}
+    late_min: dict[int, float] = {}
+    lunch_break_start_min: float | None = None
+
+    def maybe_take_lunch(completed_stops: int) -> bool:
+        nonlocal current_time, lunch_break_start_min
+        if lunch_break_after_stop_count != completed_stops:
+            return True
+        lunch_window = lunch_break_interval_after(current_time)
+        if lunch_window is None:
+            return False
+        lunch_break_start_min, current_time = lunch_window
+        return True
+
+    if not maybe_take_lunch(0):
+        return None
+
+    for idx, stop_id in enumerate(stop_sequence):
+        stop = instance.stops[stop_id]
+        current_time += instance.travel_minutes[current_node, stop_id]
+        service_start_min[stop_id] = current_time
+        late_min[stop_id] = max(current_time - stop.latest_min, 0.0)
+        current_time += stop.service_min
+        current_node = stop_id
+        if not maybe_take_lunch(idx + 1):
+            return None
+
+    current_time += instance.travel_minutes[current_node, DEPOT_NODE]
+    return RouteTimingEvaluation(
+        service_start_min=service_start_min,
+        late_min=late_min,
+        return_min=current_time,
+        lunch_break_start_min=lunch_break_start_min,
+    )
+
+
 def evaluate_route_sequence(
     instance: Instance,
     vehicle_type: VehicleTypeData,
     stop_sequence: tuple[int, ...],
 ) -> RouteColumn | None:
     if not stop_sequence:
+        return None
+    if not stop_sequence_respects_required_adjacencies(stop_sequence):
         return None
 
     start_limit = vehicle_start_limit(instance, vehicle_type)
@@ -1681,48 +1853,83 @@ def evaluate_route_sequence(
     if load_kg > vehicle_type.capacity_kg + 1e-9:
         return None
 
-    current_time = start_limit
     current_node = DEPOT_NODE
     distance_mi = 0.0
-    service_start_min: dict[int, float] = {}
-    late_min: dict[int, float] = {}
-
     for stop_id in stop_sequence:
-        stop = instance.stops[stop_id]
-        current_time += instance.travel_minutes[current_node, stop_id]
-        service_start_min[stop_id] = current_time
-        late_min[stop_id] = max(current_time - stop.latest_min, 0.0)
         distance_mi += instance.distance_miles[current_node, stop_id]
-        current_time += stop.service_min
         current_node = stop_id
 
     distance_mi += instance.distance_miles[current_node, DEPOT_NODE]
-    current_time += instance.travel_minutes[current_node, DEPOT_NODE]
-    return_min = current_time
-    if return_min > end_limit + 1e-9:
+    route_distance_cost = distance_mi * route_distance_unit_cost(instance, vehicle_type)
+
+    baseline_timing = simulate_stop_sequence_timing(
+        instance=instance,
+        start_limit=start_limit,
+        stop_sequence=stop_sequence,
+        lunch_break_after_stop_count=None,
+    )
+    if baseline_timing is None:
         return None
 
-    active_min = return_min - start_limit
-
-    cost = vehicle_type.fixed_daily_cost
-    cost += distance_mi * route_distance_unit_cost(instance, vehicle_type)
-    cost += operating_labor_cost(instance, active_min)
-    cost += sum(late_min.values()) / 60.0 * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
-
-    return RouteColumn(
-        type_id=vehicle_type.type_id,
-        vehicle_type=vehicle_type.vehicle_type,
-        stop_sequence=stop_sequence,
-        stop_set=frozenset(stop_sequence),
-        arc_set=route_arc_set(stop_sequence),
-        cost=cost,
-        load_kg=load_kg,
-        distance_mi=distance_mi,
-        active_min=active_min,
-        return_min=return_min,
-        service_start_min=service_start_min,
-        late_min=late_min,
+    candidate_timings: list[RouteTimingEvaluation] = []
+    lunch_break_required = (
+        MIDDAY_LUNCH_BREAK_RULE is not None
+        and route_overlaps_interval(
+            route_start_min=start_limit,
+            route_end_min=baseline_timing.return_min,
+            interval_start_min=MIDDAY_LUNCH_BREAK_RULE.window_start_min,
+            interval_end_min=MIDDAY_LUNCH_BREAK_RULE.window_end_min,
+        )
     )
+    if lunch_break_required:
+        for break_after_stop_count in range(len(stop_sequence) + 1):
+            timing = simulate_stop_sequence_timing(
+                instance=instance,
+                start_limit=start_limit,
+                stop_sequence=stop_sequence,
+                lunch_break_after_stop_count=break_after_stop_count,
+            )
+            if timing is None or timing.return_min > end_limit + 1e-9:
+                continue
+            candidate_timings.append(timing)
+    elif baseline_timing.return_min <= end_limit + 1e-9:
+        candidate_timings.append(baseline_timing)
+
+    if not candidate_timings:
+        return None
+
+    best_route: RouteColumn | None = None
+    best_score: tuple[float, float, float] | None = None
+    for timing in candidate_timings:
+        active_min = timing.return_min - start_limit
+        cost = vehicle_type.fixed_daily_cost + route_distance_cost
+        cost += operating_labor_cost(instance, active_min)
+        cost += (
+            sum(timing.late_min.values())
+            / 60.0
+            * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+        )
+        score = (cost, timing.return_min, sum(timing.late_min.values()))
+        if best_score is not None and score >= best_score:
+            continue
+        best_score = score
+        best_route = RouteColumn(
+            type_id=vehicle_type.type_id,
+            vehicle_type=vehicle_type.vehicle_type,
+            stop_sequence=stop_sequence,
+            stop_set=frozenset(stop_sequence),
+            arc_set=route_arc_set(stop_sequence),
+            cost=cost,
+            load_kg=load_kg,
+            distance_mi=distance_mi,
+            active_min=active_min,
+            return_min=timing.return_min,
+            service_start_min=timing.service_start_min,
+            late_min=timing.late_min,
+            lunch_break_start_min=timing.lunch_break_start_min,
+        )
+
+    return best_route
 
 
 def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
@@ -1892,6 +2099,31 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         },
         name="load_after_kg",
     )
+    lunch_required = model.addVars(vehicle_ids, vtype=GRB.BINARY, name="lunch_required")
+    lunch_start_min = model.addVars(
+        vehicle_ids,
+        lb=0.0,
+        ub={
+            vehicle_id: (
+                MIDDAY_LUNCH_BREAK_RULE.latest_start_min
+                if MIDDAY_LUNCH_BREAK_RULE is not None
+                and start_limit[vehicle_id] < MIDDAY_LUNCH_BREAK_RULE.window_end_min - 1e-9
+                else 0.0
+            )
+            for vehicle_id in vehicle_ids
+        },
+        name="lunch_start_min",
+    )
+    served_after_lunch = model.addVars(
+        vehicle_ids,
+        stop_ids,
+        vtype=GRB.BINARY,
+        name="served_after_lunch",
+    )
+
+    lunch_big_m = max_time_bound + (
+        MIDDAY_LUNCH_BREAK_RULE.duration_min if MIDDAY_LUNCH_BREAK_RULE is not None else 0.0
+    )
 
     fixed_arc_count = 0
     for vehicle_id, i, j in arc_keys:
@@ -1979,6 +2211,25 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             name=f"late_lb[{stop_id}]",
         )
 
+    # Hard operational rule: the Redstone Plaza deliveries must stay on the
+    # same truck and be served consecutively, but the model may choose 7->8 or
+    # 8->7. These assignment/arc constraints are much tighter than trying to
+    # infer the rule from timing alone.
+    for rule in REDSTONE_PLAZA_PAIR_RULES:
+        if rule.stop_a not in stop_ids or rule.stop_b not in stop_ids:
+            continue
+        for vehicle_id in vehicle_ids:
+            model.addConstr(
+                visit[vehicle_id, rule.stop_a] == visit[vehicle_id, rule.stop_b],
+                name=f"paired_stop_same_vehicle[{vehicle_id},{rule.stop_a},{rule.stop_b}]",
+            )
+            model.addConstr(
+                x[vehicle_id, rule.stop_a, rule.stop_b]
+                + x[vehicle_id, rule.stop_b, rule.stop_a]
+                == visit[vehicle_id, rule.stop_a],
+                name=f"paired_stop_adjacent[{vehicle_id},{rule.stop_a},{rule.stop_b}]",
+            )
+
     symmetry_group_count = 0
     for group in identical_vehicle_groups.values():
         sorted_group = sorted(group)
@@ -2061,6 +2312,34 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             <= billed_operating_hours(route_horizon[vehicle_id]) * use_vehicle[vehicle_id],
             name=f"billed_hours_cap[{vehicle_id}]",
         )
+        model.addConstr(
+            lunch_required[vehicle_id] <= use_vehicle[vehicle_id],
+            name=f"lunch_use_link[{vehicle_id}]",
+        )
+
+        if (
+            MIDDAY_LUNCH_BREAK_RULE is not None
+            and start_limit[vehicle_id] < MIDDAY_LUNCH_BREAK_RULE.window_end_min - 1e-9
+        ):
+            model.addConstr(
+                return_min[vehicle_id]
+                <= MIDDAY_LUNCH_BREAK_RULE.window_start_min
+                + (end_limit[vehicle_id] - MIDDAY_LUNCH_BREAK_RULE.window_start_min)
+                * lunch_required[vehicle_id],
+                name=f"lunch_required_if_midday_overlap[{vehicle_id}]",
+            )
+            model.addConstr(
+                lunch_start_min[vehicle_id]
+                >= MIDDAY_LUNCH_BREAK_RULE.window_start_min * lunch_required[vehicle_id],
+                name=f"lunch_window_lb[{vehicle_id}]",
+            )
+            model.addConstr(
+                lunch_start_min[vehicle_id]
+                <= MIDDAY_LUNCH_BREAK_RULE.latest_start_min * lunch_required[vehicle_id],
+                name=f"lunch_window_ub[{vehicle_id}]",
+            )
+        else:
+            lunch_required[vehicle_id].ub = 0.0
 
         for stop_id in stop_ids:
             stop = instance.stops[stop_id]
@@ -2072,6 +2351,30 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 load_after_kg[vehicle_id, stop_id] <= vehicle.capacity_kg * visit[vehicle_id, stop_id],
                 name=f"load_ub[{vehicle_id},{stop_id}]",
             )
+            model.addConstr(
+                served_after_lunch[vehicle_id, stop_id] <= visit[vehicle_id, stop_id],
+                name=f"lunch_state_visit_link[{vehicle_id},{stop_id}]",
+            )
+            model.addConstr(
+                served_after_lunch[vehicle_id, stop_id] <= lunch_required[vehicle_id],
+                name=f"lunch_state_required_link[{vehicle_id},{stop_id}]",
+            )
+            if MIDDAY_LUNCH_BREAK_RULE is not None:
+                model.addConstr(
+                    service_start_min[stop_id] + stop.service_min
+                    <= lunch_start_min[vehicle_id]
+                    + lunch_big_m
+                    * (served_after_lunch[vehicle_id, stop_id] + 1 - visit[vehicle_id, stop_id]),
+                    name=f"served_before_lunch[{vehicle_id},{stop_id}]",
+                )
+                model.addConstr(
+                    service_start_min[stop_id]
+                    >= lunch_start_min[vehicle_id]
+                    + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                    - lunch_big_m
+                    * (2 - served_after_lunch[vehicle_id, stop_id] - visit[vehicle_id, stop_id]),
+                    name=f"served_after_lunch[{vehicle_id},{stop_id}]",
+                )
             model.addConstr(
                 service_start_min[stop_id]
                 >= vehicle_stop_lb[vehicle_id, stop_id]
@@ -2088,6 +2391,12 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 model.addConstr(
                     service_start_min[stop_id] - depart_min[vehicle_id]
                     >= instance.travel_minutes[DEPOT_NODE, stop_id]
+                    + (
+                        MIDDAY_LUNCH_BREAK_RULE.duration_min
+                        * served_after_lunch[vehicle_id, stop_id]
+                        if MIDDAY_LUNCH_BREAK_RULE is not None
+                        else 0.0
+                    )
                     - start_arc_m[vehicle_id, stop_id] * (1 - x[vehicle_id, DEPOT_NODE, stop_id]),
                     name=f"time_from_depot[{vehicle_id},{stop_id}]",
                 )
@@ -2102,26 +2411,127 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                     + (vehicle.capacity_kg - stop.demand_kg) * (1 - x[vehicle_id, DEPOT_NODE, stop_id]),
                     name=f"load_from_depot_ub[{vehicle_id},{stop_id}]",
                 )
+                if MIDDAY_LUNCH_BREAK_RULE is not None:
+                    model.addConstr(
+                        lunch_start_min[vehicle_id]
+                        >= depart_min[vehicle_id]
+                        - lunch_big_m
+                        * (
+                            2
+                            - x[vehicle_id, DEPOT_NODE, stop_id]
+                            - served_after_lunch[vehicle_id, stop_id]
+                        ),
+                        name=f"lunch_on_first_arc_lb[{vehicle_id},{stop_id}]",
+                    )
+                    model.addConstr(
+                        lunch_start_min[vehicle_id]
+                        <= service_start_min[stop_id]
+                        - instance.travel_minutes[DEPOT_NODE, stop_id]
+                        - MIDDAY_LUNCH_BREAK_RULE.duration_min
+                        + lunch_big_m
+                        * (
+                            2
+                            - x[vehicle_id, DEPOT_NODE, stop_id]
+                            - served_after_lunch[vehicle_id, stop_id]
+                        ),
+                        name=f"lunch_on_first_arc_ub[{vehicle_id},{stop_id}]",
+                    )
             if feasible_arc[vehicle_id, stop_id, DEPOT_NODE]:
                 model.addConstr(
                     return_min[vehicle_id] - service_start_min[stop_id]
                     >= instance.stops[stop_id].service_min
                     + instance.travel_minutes[stop_id, DEPOT_NODE]
+                    + (
+                        MIDDAY_LUNCH_BREAK_RULE.duration_min
+                        * (lunch_required[vehicle_id] - served_after_lunch[vehicle_id, stop_id])
+                        if MIDDAY_LUNCH_BREAK_RULE is not None
+                        else 0.0
+                    )
                     - end_arc_m[vehicle_id, stop_id] * (1 - x[vehicle_id, stop_id, DEPOT_NODE]),
                     name=f"time_to_depot[{vehicle_id},{stop_id}]",
                 )
+                if MIDDAY_LUNCH_BREAK_RULE is not None:
+                    model.addConstr(
+                        lunch_start_min[vehicle_id]
+                        >= service_start_min[stop_id]
+                        + stop.service_min
+                        - lunch_big_m
+                        * (
+                            2
+                            - x[vehicle_id, stop_id, DEPOT_NODE]
+                            - lunch_required[vehicle_id]
+                            + served_after_lunch[vehicle_id, stop_id]
+                        ),
+                        name=f"lunch_on_return_arc_lb[{vehicle_id},{stop_id}]",
+                    )
+                    model.addConstr(
+                        lunch_start_min[vehicle_id]
+                        <= return_min[vehicle_id]
+                        - MIDDAY_LUNCH_BREAK_RULE.duration_min
+                        + lunch_big_m
+                        * (
+                            2
+                            - x[vehicle_id, stop_id, DEPOT_NODE]
+                            - lunch_required[vehicle_id]
+                            + served_after_lunch[vehicle_id, stop_id]
+                        ),
+                        name=f"lunch_on_return_arc_ub[{vehicle_id},{stop_id}]",
+                    )
 
         for stop_id in stop_ids:
             for next_stop in stop_ids:
                 if stop_id == next_stop or not feasible_arc[vehicle_id, stop_id, next_stop]:
                     continue
                 model.addConstr(
+                    served_after_lunch[vehicle_id, next_stop]
+                    >= served_after_lunch[vehicle_id, stop_id]
+                    - (1 - x[vehicle_id, stop_id, next_stop]),
+                    name=f"lunch_state_monotone[{vehicle_id},{stop_id},{next_stop}]",
+                )
+                model.addConstr(
                     service_start_min[next_stop] - service_start_min[stop_id]
                     >= instance.stops[stop_id].service_min
                     + instance.travel_minutes[stop_id, next_stop]
+                    + (
+                        MIDDAY_LUNCH_BREAK_RULE.duration_min
+                        * (
+                            served_after_lunch[vehicle_id, next_stop]
+                            - served_after_lunch[vehicle_id, stop_id]
+                        )
+                        if MIDDAY_LUNCH_BREAK_RULE is not None
+                        else 0.0
+                    )
                     - stop_arc_m[vehicle_id, stop_id, next_stop] * (1 - x[vehicle_id, stop_id, next_stop]),
                     name=f"time_between_stops[{vehicle_id},{stop_id},{next_stop}]",
                 )
+                if MIDDAY_LUNCH_BREAK_RULE is not None:
+                    model.addConstr(
+                        lunch_start_min[vehicle_id]
+                        >= service_start_min[stop_id]
+                        + instance.stops[stop_id].service_min
+                        - lunch_big_m
+                        * (
+                            2
+                            - x[vehicle_id, stop_id, next_stop]
+                            - served_after_lunch[vehicle_id, next_stop]
+                            + served_after_lunch[vehicle_id, stop_id]
+                        ),
+                        name=f"lunch_between_stops_lb[{vehicle_id},{stop_id},{next_stop}]",
+                    )
+                    model.addConstr(
+                        lunch_start_min[vehicle_id]
+                        <= service_start_min[next_stop]
+                        - instance.travel_minutes[stop_id, next_stop]
+                        - MIDDAY_LUNCH_BREAK_RULE.duration_min
+                        + lunch_big_m
+                        * (
+                            2
+                            - x[vehicle_id, stop_id, next_stop]
+                            - served_after_lunch[vehicle_id, next_stop]
+                            + served_after_lunch[vehicle_id, stop_id]
+                        ),
+                        name=f"lunch_between_stops_ub[{vehicle_id},{stop_id},{next_stop}]",
+                    )
                 model.addConstr(
                     load_after_kg[vehicle_id, next_stop]
                     >= load_after_kg[vehicle_id, stop_id]
@@ -2158,6 +2568,9 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         "late_min": late_min,
         "billed_hours": billed_hours,
         "load_after_kg": load_after_kg,
+        "lunch_required": lunch_required,
+        "lunch_start_min": lunch_start_min,
+        "served_after_lunch": served_after_lunch,
         "incoming": incoming,
         "starts": starts,
         "returns": returns,
@@ -2283,6 +2696,11 @@ def solve_arc_flow_model(
                 stop_id: data["service_start_min"][stop_id].X for stop_id in served_stops
             }
             late_min = {stop_id: data["late_min"][stop_id].X for stop_id in served_stops}
+            lunch_break_start_min = (
+                data["lunch_start_min"][vehicle_id].X
+                if data["lunch_required"][vehicle_id].X > 0.5
+                else None
+            )
             distance_cost = data["distance_cost_expr"][vehicle_id].getValue()
             billed_hours = int(round(data["billed_hours"][vehicle_id].X))
             route_cost = (
@@ -2307,6 +2725,7 @@ def solve_arc_flow_model(
                     route_cost=route_cost,
                     service_start_min=service_start_min,
                     late_min=late_min,
+                    lunch_break_start_min=lunch_break_start_min,
                 )
             )
 
@@ -2380,6 +2799,13 @@ def solve_arc_flow_model(
             f"Active {vehicle_solution.active_min:.1f} min, Drive {vehicle_solution.drive_min:.1f} min, "
             f"Service {vehicle_solution.service_min:.1f} min, Billed {vehicle_solution.billed_hours} h"
         )
+        if vehicle_solution.lunch_break_start_min is not None:
+            lunch_end = vehicle_solution.lunch_break_start_min + MIDDAY_LUNCH_BREAK_RULE.duration_min
+            print(
+                "  "
+                f"Lunch break {minutes_to_clock(vehicle_solution.lunch_break_start_min)}-"
+                f"{minutes_to_clock(lunch_end)}"
+            )
         print(
             "  "
             f"Distance cost {vehicle_solution.distance_cost:.2f}, "
@@ -2529,6 +2955,11 @@ def initial_routes(
 ) -> list[RouteColumn]:
     routes: list[RouteColumn] = []
     for vehicle_type in vehicle_types.values():
+        for rule in REDSTONE_PLAZA_PAIR_RULES:
+            for stop_sequence in ((rule.stop_a, rule.stop_b), (rule.stop_b, rule.stop_a)):
+                route = evaluate_route_sequence(instance, vehicle_type, stop_sequence)
+                if route is not None:
+                    routes.append(route)
         for stop_id in sorted(instance.stops):
             route = evaluate_route_sequence(instance, vehicle_type, (stop_id,))
             if route is not None:
@@ -2673,6 +3104,8 @@ def build_branch_context(
 
 
 def route_is_compatible(route: RouteColumn, branch_ctx: BranchContext) -> bool:
+    if not route_respects_required_adjacencies(route):
+        return False
     if route.arc_set & branch_ctx.forbidden_arcs:
         return False
 
@@ -2883,9 +3316,30 @@ def solve_pricing_subproblem(
     frontier: list[tuple[float, float, int]] = []
     explored_labels = 0
 
+    def pending_required_adjacent_partner(label: PricingLabel) -> int | None:
+        partner = REQUIRED_ADJACENT_STOP_PARTNER.get(label.node)
+        if partner is None or partner not in stop_mask:
+            return None
+        if label.visited_mask & stop_mask[partner]:
+            return None
+        return partner
+
+    def completion_delta_to_depot(label: PricingLabel) -> float | None:
+        travel_to_depot = instance.travel_minutes[label.node, DEPOT_NODE]
+        if MIDDAY_LUNCH_BREAK_RULE is None or label.lunch_break_taken:
+            return travel_to_depot
+        if label.time_after_service + travel_to_depot <= MIDDAY_LUNCH_BREAK_RULE.window_start_min + 1e-9:
+            return travel_to_depot
+        lunch_window = lunch_break_interval_after(label.time_after_service)
+        if lunch_window is None:
+            return None
+        _, break_end = lunch_window
+        return (break_end - label.time_after_service) + travel_to_depot
+
     def dominates(lhs: PricingLabel, rhs: PricingLabel) -> bool:
         return (
             lhs.node == rhs.node
+            and lhs.lunch_break_taken == rhs.lunch_break_taken
             and lhs.time_after_service <= rhs.time_after_service + 1e-9
             and lhs.load_kg <= rhs.load_kg + 1e-9
             and lhs.nonlabor_reduced_cost <= rhs.nonlabor_reduced_cost + 1e-9
@@ -2971,6 +3425,10 @@ def solve_pricing_subproblem(
         if mandatory_info is None:
             return float("inf")
         _, requirement_demand, requirement_time_lb = mandatory_info
+        if MIDDAY_LUNCH_BREAK_RULE is not None and not label.lunch_break_taken:
+            earliest_completion_without_break = label.time_after_service + requirement_time_lb
+            if earliest_completion_without_break > MIDDAY_LUNCH_BREAK_RULE.window_start_min + 1e-9:
+                requirement_time_lb += MIDDAY_LUNCH_BREAK_RULE.duration_min
         if label.load_kg + requirement_demand > vehicle_type.capacity_kg + 1e-9:
             return float("inf")
         if label.time_after_service + requirement_time_lb > end_limit + 1e-9:
@@ -2980,6 +3438,8 @@ def solve_pricing_subproblem(
         return label.reduced_cost - optimistic_remaining_reward(label)
 
     def can_return_from(label: PricingLabel) -> bool:
+        if pending_required_adjacent_partner(label) is not None:
+            return False
         if label.node in branch_ctx.forced_successor:
             return False
         if (label.node, DEPOT_NODE) in branch_ctx.forbidden_arcs:
@@ -2988,14 +3448,16 @@ def solve_pricing_subproblem(
             visited_group_mask = label.visited_mask & group_mask
             if visited_group_mask not in {0, group_mask}:
                 return False
-        return (
-            label.time_after_service + instance.travel_minutes[label.node, DEPOT_NODE]
-            <= end_limit + 1e-9
-        )
+        completion_delta = completion_delta_to_depot(label)
+        if completion_delta is None:
+            return False
+        return label.time_after_service + completion_delta <= end_limit + 1e-9
 
     def complete_reduced_cost(label: PricingLabel) -> float:
         elapsed_before = label.time_after_service - start_limit
-        return_delta = instance.travel_minutes[label.node, DEPOT_NODE]
+        return_delta = completion_delta_to_depot(label)
+        if return_delta is None:
+            return float("inf")
         return (
             label.reduced_cost
             + instance.distance_miles[label.node, DEPOT_NODE] * distance_unit_cost
@@ -3027,6 +3489,12 @@ def solve_pricing_subproblem(
         return route_reduced_cost(route, cover_duals=cover_duals, type_dual=type_dual)
 
     def add_label(label: PricingLabel) -> int | None:
+        if (
+            MIDDAY_LUNCH_BREAK_RULE is not None
+            and not label.lunch_break_taken
+            and label.time_after_service > MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9
+        ):
+            return None
         optimistic_lb = optimistic_completion_lower_bound(label)
         if optimistic_lb >= -REDUCED_COST_TOL:
             return None
@@ -3052,13 +3520,27 @@ def solve_pricing_subproblem(
 
     def candidate_successors(label: PricingLabel) -> list[int]:
         forced_next = branch_ctx.forced_successor.get(label.node)
+        required_partner = pending_required_adjacent_partner(label)
         if forced_next is not None:
             if (
-                forced_next in stop_mask
+                (required_partner is None or forced_next == required_partner)
+                and forced_next in stop_mask
                 and label.visited_mask & stop_mask[forced_next] == 0
                 and forced_next in potential_successors[label.node]
             ):
                 return [forced_next]
+            return []
+
+        if required_partner is not None:
+            forced_pred = branch_ctx.forced_predecessor.get(required_partner)
+            if (
+                required_partner in stop_mask
+                and label.visited_mask & stop_mask[required_partner] == 0
+                and required_partner in potential_successors[label.node]
+                and not (separated_mask_by_stop[required_partner] & label.visited_mask)
+                and (forced_pred is None or forced_pred == label.node)
+            ):
+                return [required_partner]
             return []
 
         if label.node in last_forced_stops:
@@ -3112,31 +3594,49 @@ def solve_pricing_subproblem(
         stop = instance.stops[start_stop]
         arrival = start_limit + instance.travel_minutes[DEPOT_NODE, start_stop]
         time_after_service = arrival + stop.service_min
-        elapsed = time_after_service - start_limit
-        reduced_cost = (
-            vehicle_type.fixed_daily_cost
-            - type_dual
-            + instance.distance_miles[DEPOT_NODE, start_stop] * distance_unit_cost
-            + incremental_labor_cost(instance, 0.0, elapsed)
-            + max(arrival - stop.latest_min, 0.0)
-            / 60.0
-            * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
-            - cover_duals[start_stop]
-        )
+        start_transition_options: list[tuple[bool, float, float]] = []
+        if (
+            MIDDAY_LUNCH_BREAK_RULE is None
+            or time_after_service <= MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9
+        ):
+            start_transition_options.append((False, arrival, time_after_service))
 
-        label_idx = add_label(
-            PricingLabel(
-                node=start_stop,
-                visited_mask=stop_mask[start_stop],
-                load_kg=stop.demand_kg,
-                time_after_service=time_after_service,
-                reduced_cost=reduced_cost,
-                nonlabor_reduced_cost=reduced_cost - operating_labor_cost(instance, elapsed),
-                predecessor_idx=None,
+        lunch_window = lunch_break_interval_after(start_limit)
+        if MIDDAY_LUNCH_BREAK_RULE is not None and lunch_window is not None:
+            _, break_end = lunch_window
+            lunch_arrival = break_end + instance.travel_minutes[DEPOT_NODE, start_stop]
+            lunch_time_after_service = lunch_arrival + stop.service_min
+            start_transition_options.append((True, lunch_arrival, lunch_time_after_service))
+
+        for lunch_break_taken, arrival_min, service_finish_min in start_transition_options:
+            if service_finish_min + instance.travel_minutes[start_stop, DEPOT_NODE] > end_limit + 1e-9:
+                continue
+            elapsed = service_finish_min - start_limit
+            reduced_cost = (
+                vehicle_type.fixed_daily_cost
+                - type_dual
+                + instance.distance_miles[DEPOT_NODE, start_stop] * distance_unit_cost
+                + incremental_labor_cost(instance, 0.0, elapsed)
+                + max(arrival_min - stop.latest_min, 0.0)
+                / 60.0
+                * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+                - cover_duals[start_stop]
             )
-        )
-        if label_idx is not None and maybe_add_route(label_idx):
-            return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
+
+            label_idx = add_label(
+                PricingLabel(
+                    node=start_stop,
+                    visited_mask=stop_mask[start_stop],
+                    load_kg=stop.demand_kg,
+                    time_after_service=service_finish_min,
+                    lunch_break_taken=lunch_break_taken,
+                    reduced_cost=reduced_cost,
+                    nonlabor_reduced_cost=reduced_cost - operating_labor_cost(instance, elapsed),
+                    predecessor_idx=None,
+                )
+            )
+            if label_idx is not None and maybe_add_route(label_idx):
+                return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
 
     while frontier:
         _, _, label_idx = heapq.heappop(frontier)
@@ -3159,49 +3659,80 @@ def solve_pricing_subproblem(
             if new_load > vehicle_type.capacity_kg + 1e-9:
                 continue
 
+            elapsed_before = label.time_after_service - start_limit
+            transition_options: list[tuple[bool, float, float, float]] = []
+
             arrival = label.time_after_service + instance.travel_minutes[label.node, next_stop]
             time_after_service = arrival + next_stop_data.service_min
-            if time_after_service + instance.travel_minutes[next_stop, DEPOT_NODE] > end_limit + 1e-9:
-                continue
-
-            elapsed_before = label.time_after_service - start_limit
-            delta_minutes = (
-                instance.travel_minutes[label.node, next_stop]
-                + next_stop_data.service_min
-            )
-            new_reduced_cost = (
-                label.reduced_cost
-                + instance.distance_miles[label.node, next_stop] * distance_unit_cost
-                + incremental_labor_cost(instance, elapsed_before, delta_minutes)
-                + max(arrival - next_stop_data.latest_min, 0.0)
-                / 60.0
-                * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
-                - cover_duals[next_stop]
-            )
-
-            new_label_idx = add_label(
-                PricingLabel(
-                    node=next_stop,
-                    visited_mask=label.visited_mask | stop_mask[next_stop],
-                    load_kg=new_load,
-                    time_after_service=time_after_service,
-                    reduced_cost=new_reduced_cost,
-                    nonlabor_reduced_cost=(
-                        label.nonlabor_reduced_cost
-                        + instance.distance_miles[label.node, next_stop] * distance_unit_cost
-                        + max(arrival - next_stop_data.latest_min, 0.0)
-                        / 60.0
-                        * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
-                        - cover_duals[next_stop]
-                    ),
-                    predecessor_idx=label_idx,
+            if (
+                MIDDAY_LUNCH_BREAK_RULE is None
+                or label.lunch_break_taken
+                or time_after_service <= MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9
+            ):
+                transition_options.append(
+                    (
+                        label.lunch_break_taken,
+                        arrival,
+                        time_after_service,
+                        instance.travel_minutes[label.node, next_stop] + next_stop_data.service_min,
+                    )
                 )
-            )
-            if new_label_idx is None:
-                continue
 
-            if maybe_add_route(new_label_idx):
-                return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
+            if MIDDAY_LUNCH_BREAK_RULE is not None and not label.lunch_break_taken:
+                lunch_window = lunch_break_interval_after(label.time_after_service)
+                if lunch_window is not None:
+                    _, break_end = lunch_window
+                    lunch_arrival = break_end + instance.travel_minutes[label.node, next_stop]
+                    lunch_time_after_service = lunch_arrival + next_stop_data.service_min
+                    transition_options.append(
+                        (
+                            True,
+                            lunch_arrival,
+                            lunch_time_after_service,
+                            (break_end - label.time_after_service)
+                            + instance.travel_minutes[label.node, next_stop]
+                            + next_stop_data.service_min,
+                        )
+                    )
+
+            for lunch_break_taken, arrival_min, service_finish_min, delta_minutes in transition_options:
+                if service_finish_min + instance.travel_minutes[next_stop, DEPOT_NODE] > end_limit + 1e-9:
+                    continue
+
+                new_reduced_cost = (
+                    label.reduced_cost
+                    + instance.distance_miles[label.node, next_stop] * distance_unit_cost
+                    + incremental_labor_cost(instance, elapsed_before, delta_minutes)
+                    + max(arrival_min - next_stop_data.latest_min, 0.0)
+                    / 60.0
+                    * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+                    - cover_duals[next_stop]
+                )
+
+                new_label_idx = add_label(
+                    PricingLabel(
+                        node=next_stop,
+                        visited_mask=label.visited_mask | stop_mask[next_stop],
+                        load_kg=new_load,
+                        time_after_service=service_finish_min,
+                        lunch_break_taken=lunch_break_taken,
+                        reduced_cost=new_reduced_cost,
+                        nonlabor_reduced_cost=(
+                            label.nonlabor_reduced_cost
+                            + instance.distance_miles[label.node, next_stop] * distance_unit_cost
+                            + max(arrival_min - next_stop_data.latest_min, 0.0)
+                            / 60.0
+                            * instance.cost_params["Late_Delivery_Penalty_per_Hour"]
+                            - cover_duals[next_stop]
+                        ),
+                        predecessor_idx=label_idx,
+                    )
+                )
+                if new_label_idx is None:
+                    continue
+
+                if maybe_add_route(new_label_idx):
+                    return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
 
     check_time_limit()
     return [route for _, route in sorted(improving_routes, key=lambda item: item[0])]
@@ -4023,7 +4554,7 @@ def create_model(
         forced_arcs=frozenset(),
         excluded_assignments=frozenset(),
         forced_assignments=frozenset(),
-        same_route_pairs=frozenset(),
+        same_route_pairs=REQUIRED_SAME_ROUTE_PAIRS,
         different_route_pairs=frozenset(),
     )
     root_result = solve_node_relaxation(
@@ -4119,7 +4650,7 @@ def branch_and_price(
             forced_arcs=frozenset(),
             excluded_assignments=frozenset(),
             forced_assignments=frozenset(),
-            same_route_pairs=frozenset(),
+            same_route_pairs=REQUIRED_SAME_ROUTE_PAIRS,
             different_route_pairs=frozenset(),
         )
         heapq.heappush(active_nodes, (0.0, 0, allocate_sequence_id(), root_state))
@@ -4739,6 +5270,13 @@ def solve_model(
             f"Active {route.active_min:.1f} min, Distance {route.distance_mi:.2f} mi, "
             f"Route cost {route.cost:.2f}"
         )
+        if route.lunch_break_start_min is not None:
+            lunch_end = route.lunch_break_start_min + MIDDAY_LUNCH_BREAK_RULE.duration_min
+            print(
+                "  "
+                f"Lunch break {minutes_to_clock(route.lunch_break_start_min)}-"
+                f"{minutes_to_clock(lunch_end)}"
+            )
         print(
             "  Route: "
             + " -> ".join(
@@ -4998,6 +5536,9 @@ def main() -> None:
             print(f"Checkpoint path: {checkpoint_manager.path}")
         if configured_wls_license is not None:
             print("Using Gurobi WLS credentials from .env, environment variables, or fallback script settings.")
+        print("Active business rules:")
+        for description in active_business_rule_descriptions():
+            print(f"  - {description}")
         if route_based_enabled:
             solve_model(
                 workbook_path=args.workbook,
