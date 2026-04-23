@@ -3,6 +3,7 @@ Fundamental constraints
 1. Stop 3 (Redstone Medical Center) must be scheduled in the late afternoon. The contractual delivery commitment is 4:00 PM, so a morning delivery is not acceptable. Assume anything after 12:00 PM is fine for now.
 2. Stop 14 (Sunrise Senior Living) cannot be served before 10:00 AM.
 3. Any driver whose route overlaps midday must take one 30-minute lunch break between 11:30 AM and 1:30 PM.
+4. Stop 5 (Construction Supply, 8617 Fourth St) must be served by a Small Van only. The Hillcrest Road area has a five-ton county road restriction, so Large Truck assignments are not allowed for this stop. It is likely that medium trucks are also not allowed but should be verified before being ruled out.
 
 Open verification item
 

@@ -76,6 +76,13 @@ class StopServiceWindowRule:
     description: str
 
 
+@dataclass(frozen=True)
+class StopAllowedVehicleTypesRule:
+    stop_id: int
+    allowed_vehicle_types: frozenset[str]
+    description: str
+
+
 REDSTONE_PLAZA_PAIR_RULES: tuple[RequiredAdjacentStopPairRule, ...] = (
     RequiredAdjacentStopPairRule(
         stop_a=7,
@@ -103,6 +110,20 @@ HARD_STOP_SERVICE_WINDOW_RULES: tuple[StopServiceWindowRule, ...] = (
 )
 HARD_STOP_SERVICE_WINDOW_RULE_BY_STOP = {
     rule.stop_id: rule for rule in HARD_STOP_SERVICE_WINDOW_RULES
+}
+
+STOP_ALLOWED_VEHICLE_TYPE_RULES: tuple[StopAllowedVehicleTypesRule, ...] = (
+    StopAllowedVehicleTypesRule(
+        stop_id=5,
+        allowed_vehicle_types=frozenset({"Small Van"}),
+        description=(
+            "Construction Supply (Stop 5, 8617 Fourth St) sits in the Hillcrest Road "
+            "restricted area and may only be served by a Small Van."
+        ),
+    ),
+)
+STOP_ALLOWED_VEHICLE_TYPE_RULE_BY_STOP = {
+    rule.stop_id: rule for rule in STOP_ALLOWED_VEHICLE_TYPE_RULES
 }
 
 MIDDAY_LUNCH_BREAK_RULE = MandatoryLunchBreakRule(
@@ -1944,6 +1965,7 @@ def incremental_labor_cost(
 def active_business_rule_descriptions() -> list[str]:
     descriptions = [rule.description for rule in HARD_STOP_SERVICE_WINDOW_RULES]
     descriptions.extend(rule.description for rule in REDSTONE_PLAZA_PAIR_RULES)
+    descriptions.extend(rule.description for rule in STOP_ALLOWED_VEHICLE_TYPE_RULES)
     if MIDDAY_LUNCH_BREAK_RULE is not None:
         descriptions.append(MIDDAY_LUNCH_BREAK_RULE.description)
     return descriptions
@@ -1965,6 +1987,11 @@ def hard_service_start_after_arrival(stop_id: int, arrival_min: float) -> float:
 
 def hard_service_finish_after_arrival(stop: StopData, arrival_min: float) -> float:
     return hard_service_start_after_arrival(stop.stop_id, arrival_min) + stop.service_min
+
+
+def vehicle_type_can_serve_stop(stop_id: int, vehicle_type_name: str) -> bool:
+    rule = STOP_ALLOWED_VEHICLE_TYPE_RULE_BY_STOP.get(stop_id)
+    return rule is None or vehicle_type_name in rule.allowed_vehicle_types
 
 
 def lunch_break_interval_after(current_time_min: float) -> tuple[float, float] | None:
@@ -2064,6 +2091,11 @@ def evaluate_route_sequence(
     if not stop_sequence:
         return None
     if not stop_sequence_respects_required_adjacencies(stop_sequence):
+        return None
+    if any(
+        not vehicle_type_can_serve_stop(stop_id, vehicle_type.vehicle_type)
+        for stop_id in stop_sequence
+    ):
         return None
 
     start_limit = vehicle_start_limit(instance, vehicle_type)
@@ -2203,7 +2235,11 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             if hard_lb is not None:
                 lb = max(lb, hard_lb)
             ub = end_limit[vehicle_id] - stop.service_min - instance.travel_minutes[stop_id, DEPOT_NODE]
-            feasible = stop.demand_kg <= vehicle.capacity_kg + 1e-9 and lb <= ub + 1e-9
+            feasible = (
+                vehicle_type_can_serve_stop(stop_id, vehicle.vehicle_type)
+                and stop.demand_kg <= vehicle.capacity_kg + 1e-9
+                and lb <= ub + 1e-9
+            )
             vehicle_stop_lb[vehicle_id, stop_id] = lb
             vehicle_stop_ub[vehicle_id, stop_id] = ub
             feasible_vehicle_stop[vehicle_id, stop_id] = feasible
@@ -3350,6 +3386,11 @@ def build_branch_context(
 def route_is_compatible(route: RouteColumn, branch_ctx: BranchContext) -> bool:
     if not route_respects_required_adjacencies(route):
         return False
+    if any(
+        not vehicle_type_can_serve_stop(stop_id, route.vehicle_type)
+        for stop_id in route.stop_set
+    ):
+        return False
     if route.arc_set & branch_ctx.forbidden_arcs:
         return False
 
@@ -3457,6 +3498,7 @@ def solve_pricing_subproblem(
 
         feasible = (
             assignment_allowed
+            and vehicle_type_can_serve_stop(stop_id, vehicle_type.vehicle_type)
             and stop.demand_kg <= vehicle_type.capacity_kg + 1e-9
             and finish_time + instance.travel_minutes[stop_id, DEPOT_NODE] <= end_limit + 1e-9
         )
