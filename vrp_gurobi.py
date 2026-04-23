@@ -32,6 +32,7 @@ INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE = 12
 INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
 DEFAULT_MIP_FORMULATION_VERSION = 3
 DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
+DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT = 1.0
 
 # ============================================================================
 # Hardcoded business rules
@@ -921,6 +922,35 @@ class ObjectiveTraceLogger:
         self._writer = None
 
 
+class IncumbentReportWriter:
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        min_improvement: float = DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT,
+    ) -> None:
+        self.path = None if path is None else path.resolve()
+        self.min_improvement = max(float(min_improvement), 0.0)
+        self.last_saved_objective: float | None = None
+
+    def should_save(self, objective: float | None, *, force: bool = False) -> bool:
+        if self.path is None or objective is None:
+            return False
+        if force or self.last_saved_objective is None:
+            return True
+        return self.last_saved_objective - objective >= self.min_improvement - 1e-9
+
+    def maybe_save(self, objective: float | None, text: str, *, force: bool = False) -> Path | None:
+        if not self.should_save(objective, force=force):
+            return None
+        if self.path is None or objective is None:
+            return None
+        saved_path = write_text_report(self.path, text)
+        self.last_saved_objective = objective
+        record_interrupt_artifact("incumbent_report", saved_path)
+        return saved_path
+
+
 def candidate_dotenv_paths() -> list[Path]:
     paths = [Path(__file__).resolve().with_name(".env"), Path.cwd() / ".env"]
     unique_paths: list[Path] = []
@@ -1390,8 +1420,13 @@ def optimize_with_heartbeat(
     progress: ProgressTracker | None,
     label: str,
     bound_logger: MIPBoundLogger | None = None,
+    mip_solution_callback: Callable[[gp.Model], None] | None = None,
 ) -> None:
-    if (progress is None or not progress.enabled) and bound_logger is None:
+    if (
+        (progress is None or not progress.enabled)
+        and bound_logger is None
+        and mip_solution_callback is None
+    ):
         model.optimize()
         return
 
@@ -1410,6 +1445,8 @@ def optimize_with_heartbeat(
     def callback(cb_model: gp.Model, where: int) -> None:
         if bound_logger is not None:
             bound_logger.record_callback(cb_model, where)
+        if where == GRB.Callback.MIPSOL and mip_solution_callback is not None:
+            mip_solution_callback(cb_model)
         if where not in active_callback_points:
             return
         if progress is None or not progress.enabled:
@@ -1500,8 +1537,8 @@ def default_interrupt_artifact_report_path(workbook_path: Path) -> Path:
     return workbook_path.parent / f"{workbook_path.stem}_interrupt_artifacts.txt"
 
 
-def default_interrupt_incumbent_report_path(workbook_path: Path) -> Path:
-    return workbook_path.parent / f"{workbook_path.stem}_interrupt_incumbent_report.txt"
+def default_incumbent_report_path(workbook_path: Path) -> Path:
+    return workbook_path.parent / f"{workbook_path.stem}_incumbent_report.txt"
 
 
 def write_interrupt_artifact_report(
@@ -2885,7 +2922,11 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     return model, model._data
 
 
-def extract_arc_flow_route(data: dict[str, Any], vehicle_id: int) -> tuple[int, ...]:
+def extract_arc_flow_route_from_solution(
+    data: dict[str, Any],
+    vehicle_id: int,
+    value_of: Callable[[gp.Var], float],
+) -> tuple[int, ...]:
     x = data["x"]
     stop_ids = data["stop_ids"]
     route = [DEPOT_NODE]
@@ -2896,7 +2937,9 @@ def extract_arc_flow_route(data: dict[str, Any], vehicle_id: int) -> tuple[int, 
         next_nodes = [
             node
             for node in stop_ids + [DEPOT_NODE]
-            if node != current and (vehicle_id, current, node) in x and x[vehicle_id, current, node].X > 0.5
+            if node != current
+            and (vehicle_id, current, node) in x
+            and value_of(x[vehicle_id, current, node]) > 0.5
         ]
         if not next_nodes:
             break
@@ -2916,24 +2959,47 @@ def extract_arc_flow_vehicle_solutions(
     instance: Instance,
     data: dict[str, Any],
 ) -> list[ArcFlowVehicleSolution]:
+    return extract_arc_flow_vehicle_solutions_from_solution(
+        instance,
+        data,
+        lambda var: float(var.X),
+    )
+
+
+def extract_arc_flow_vehicle_solutions_from_solution(
+    instance: Instance,
+    data: dict[str, Any],
+    value_of: Callable[[gp.Var], float],
+) -> list[ArcFlowVehicleSolution]:
     vehicle_solutions: list[ArcFlowVehicleSolution] = []
     for vehicle_id in data["vehicle_ids"]:
-        if data["use_vehicle"][vehicle_id].X < 0.5:
+        if value_of(data["use_vehicle"][vehicle_id]) < 0.5:
             continue
         vehicle = instance.vehicles[vehicle_id]
-        route = extract_arc_flow_route(data, vehicle_id)
+        route = extract_arc_flow_route_from_solution(data, vehicle_id, value_of)
         served_stops = [stop_id for stop_id in route if stop_id != DEPOT_NODE]
-        service_start_min = {
-            stop_id: data["service_start_min"][stop_id].X for stop_id in served_stops
-        }
-        late_min = {stop_id: data["late_min"][stop_id].X for stop_id in served_stops}
+        service_start_min = {stop_id: value_of(data["service_start_min"][stop_id]) for stop_id in served_stops}
+        late_min = {stop_id: value_of(data["late_min"][stop_id]) for stop_id in served_stops}
         lunch_break_start_min = (
-            data["lunch_start_min"][vehicle_id].X
-            if data["lunch_required"][vehicle_id].X > 0.5
+            value_of(data["lunch_start_min"][vehicle_id])
+            if value_of(data["lunch_required"][vehicle_id]) > 0.5
             else None
         )
-        distance_cost = data["distance_cost_expr"][vehicle_id].getValue()
-        billed_hours = int(round(data["billed_hours"][vehicle_id].X))
+        distance_cost = sum(
+            instance.distance_miles[i, j]
+            * (
+                vehicle.cost_per_mile
+                + instance.cost_params["Fuel_Cost_per_Liter"]
+                * instance.cost_params["Avg_Fuel_Consumption_L_per_mile"]
+            )
+            for i, j in zip(route, route[1:])
+        )
+        billed_hours = int(round(value_of(data["billed_hours"][vehicle_id])))
+        drive_min = sum(instance.travel_minutes[i, j] for i, j in zip(route, route[1:]))
+        service_min = sum(instance.stops[stop_id].service_min for stop_id in served_stops)
+        load_kg = sum(instance.stops[stop_id].demand_kg for stop_id in served_stops)
+        depart_min = value_of(data["depart_min"][vehicle_id])
+        return_min = value_of(data["return_min"][vehicle_id])
         route_cost = (
             vehicle.fixed_daily_cost
             + distance_cost
@@ -2945,12 +3011,12 @@ def extract_arc_flow_vehicle_solutions(
                 vehicle_id=vehicle_id,
                 vehicle=vehicle,
                 route=route,
-                load_kg=sum(instance.stops[stop_id].demand_kg for stop_id in served_stops),
-                depart_min=data["depart_min"][vehicle_id].X,
-                return_min=data["return_min"][vehicle_id].X,
-                drive_min=data["drive_min_expr"][vehicle_id].getValue(),
-                service_min=data["service_min_expr"][vehicle_id].getValue(),
-                active_min=data["active_min_expr"][vehicle_id].getValue(),
+                load_kg=load_kg,
+                depart_min=depart_min,
+                return_min=return_min,
+                drive_min=drive_min,
+                service_min=service_min,
+                active_min=return_min - depart_min,
                 billed_hours=billed_hours,
                 distance_cost=distance_cost,
                 route_cost=route_cost,
@@ -3119,45 +3185,6 @@ def render_branch_and_price_route_report(
     return "\n".join(lines)
 
 
-def save_route_based_interrupt_incumbent_report(
-    workbook_path: Path,
-    checkpoint_path: Path | None,
-) -> Path | None:
-    if checkpoint_path is None or not checkpoint_path.is_file():
-        return None
-
-    try:
-        instance = load_instance(workbook_path)
-        vehicle_types = build_vehicle_types(instance)
-        checkpoint_state = load_branch_and_price_checkpoint(
-            checkpoint_path,
-            workbook_path=workbook_path,
-            instance=instance,
-            vehicle_types=vehicle_types,
-        )
-    except Exception:
-        return None
-
-    if not checkpoint_state.incumbent_routes:
-        return None
-
-    report_path = default_interrupt_incumbent_report_path(workbook_path)
-    report_text = render_branch_and_price_route_report(
-        instance,
-        status="INTERRUPTED",
-        objective=checkpoint_state.incumbent_obj,
-        best_bound=None,
-        gap=None,
-        selected_routes=checkpoint_state.incumbent_routes,
-        vehicle_types=vehicle_types,
-        nodes_processed=checkpoint_state.nodes_processed,
-        nodes_pruned=checkpoint_state.nodes_pruned,
-        root_lp_objective=checkpoint_state.root_lp_objective,
-        global_columns=len(checkpoint_state.route_pool),
-    )
-    return write_text_report(report_path, report_text)
-
-
 def solve_arc_flow_model(
     workbook_path: Path,
     time_limit: float | None,
@@ -3167,6 +3194,7 @@ def solve_arc_flow_model(
     progress: ProgressTracker | None = None,
     trace_logger: ObjectiveTraceLogger | None = None,
     persistence_manager: MIPPersistenceManager | None = None,
+    incumbent_report_writer: IncumbentReportWriter | None = None,
 ) -> ArcFlowSolveResult:
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     bound_plot_path = default_mip_bound_plot_path(workbook_path, run_timestamp)
@@ -3191,12 +3219,44 @@ def solve_arc_flow_model(
         if persistence_manager is not None:
             loaded_start_path = persistence_manager.load_start(model, workbook_path)
 
+        def maybe_save_mip_incumbent_report(cb_model: gp.Model) -> None:
+            try:
+                if incumbent_report_writer is None:
+                    return
+                objective = float(cb_model.cbGet(GRB.Callback.MIPSOL_OBJ))
+                if not incumbent_report_writer.should_save(objective):
+                    return
+                best_bound = MIPBoundLogger._normalize_bound(cb_model.cbGet(GRB.Callback.MIPSOL_OBJBND))
+                gap = relative_gap(objective, best_bound)
+                vehicle_solutions = extract_arc_flow_vehicle_solutions_from_solution(
+                    instance,
+                    data,
+                    lambda var: float(cb_model.cbGetSolution(var)),
+                )
+                report_text = render_arc_flow_vehicle_solution_report(
+                    instance,
+                    vehicle_solutions,
+                    status="RUNNING",
+                    objective=objective,
+                    best_bound=best_bound,
+                    gap=gap,
+                )
+                saved_path = incumbent_report_writer.maybe_save(objective, report_text)
+                if saved_path is not None and progress is not None:
+                    progress.emit(
+                        f"arc-flow master MIP: saved incumbent route report to {saved_path}",
+                        force=True,
+                    )
+            except Exception:
+                return
+
         try:
             optimize_with_heartbeat(
                 model,
                 progress=progress,
                 label="arc-flow master MIP",
                 bound_logger=bound_logger,
+                mip_solution_callback=maybe_save_mip_incumbent_report,
             )
             capture_mip_bound_snapshot(model, bound_logger)
         except KeyboardInterrupt:
@@ -3220,21 +3280,8 @@ def solve_arc_flow_model(
                     gap=interrupted_gap,
                     note="Arc-flow MIP interrupted",
                 )
-            if model.SolCount > 0:
-                interrupted_vehicle_solutions = extract_arc_flow_vehicle_solutions(instance, data)
-                interrupted_report_path = write_text_report(
-                    default_interrupt_incumbent_report_path(workbook_path),
-                    render_arc_flow_vehicle_solution_report(
-                        instance,
-                        interrupted_vehicle_solutions,
-                        status="INTERRUPTED",
-                        objective=interrupted_objective,
-                        best_bound=interrupted_best_bound,
-                        gap=interrupted_gap,
-                    ),
-                )
-                record_interrupt_artifact("interrupt_incumbent_report", interrupted_report_path)
-                print(f"Saved interrupt incumbent route report to {interrupted_report_path}")
+            if incumbent_report_writer is not None and incumbent_report_writer.path is not None:
+                record_interrupt_artifact("incumbent_report", incumbent_report_writer.path)
             if saved_bound_plot_path is not None:
                 record_interrupt_artifact("partial_mip_bound_plot", saved_bound_plot_path)
                 print(f"\nPartial MIP bound plot saved to {saved_bound_plot_path}")
@@ -3290,6 +3337,19 @@ def solve_arc_flow_model(
                 best_bound=result.best_bound,
                 relative_gap=result.gap,
                 note="Arc-flow MIP finished",
+            )
+        if incumbent_report_writer is not None and result.objective is not None:
+            incumbent_report_writer.maybe_save(
+                result.objective,
+                render_arc_flow_vehicle_solution_report(
+                    instance,
+                    result.vehicle_solutions,
+                    status=result.status,
+                    objective=result.objective,
+                    best_bound=result.best_bound,
+                    gap=result.gap,
+                ),
+                force=True,
             )
 
         print(f"Status: {result.status}")
@@ -5165,6 +5225,7 @@ def branch_and_price(
     progress: ProgressTracker | None = None,
     trace_logger: ObjectiveTraceLogger | None = None,
     checkpoint_manager: CheckpointManager | None = None,
+    incumbent_report_writer: IncumbentReportWriter | None = None,
     resume_from: Path | None = None,
 ) -> BranchAndPriceResult:
     validate_shared_cost_assumptions(instance)
@@ -5247,6 +5308,32 @@ def branch_and_price(
             status=status,
             note=note,
         )
+
+    def maybe_save_incumbent_report(*, force: bool = False) -> None:
+        if incumbent_report_writer is None or incumbent_obj is None:
+            return
+        saved_path = incumbent_report_writer.maybe_save(
+            incumbent_obj,
+            render_branch_and_price_route_report(
+                instance,
+                status="RUNNING" if status == "UNKNOWN" else status,
+                objective=incumbent_obj,
+                best_bound=current_global_bound(),
+                gap=relative_gap(incumbent_obj, current_global_bound()),
+                selected_routes=incumbent_routes,
+                vehicle_types=vehicle_types,
+                nodes_processed=nodes_processed,
+                nodes_pruned=nodes_pruned,
+                root_lp_objective=root_lp_objective,
+                global_columns=len(route_pool),
+            ),
+            force=force,
+        )
+        if saved_path is not None and progress is not None:
+            progress.emit(
+                f"branch-and-price: saved incumbent route report to {saved_path}",
+                force=True,
+            )
 
     def current_global_bound(active_node_hint: float | None = None) -> float | None:
         if root_lp_objective is None and nodes_processed == 0 and current_node is None:
@@ -5337,6 +5424,7 @@ def branch_and_price(
                 force=True,
                 note="Initial restricted-master incumbent",
             )
+            maybe_save_incumbent_report(force=True)
             save_checkpoint("Captured initial restricted-master incumbent")
     else:
         if progress is not None:
@@ -5350,6 +5438,8 @@ def branch_and_price(
             force=True,
             note=f"Resumed from checkpoint {resume_from}",
         )
+        if incumbent_routes:
+            maybe_save_incumbent_report(force=True)
 
     while current_node is not None or active_nodes:
         if max_bp_nodes is not None and nodes_processed >= max_bp_nodes:
@@ -5506,6 +5596,7 @@ def branch_and_price(
                         note="Improved incumbent from restricted master",
                         node_depth=depth,
                     )
+                    maybe_save_incumbent_report()
                     save_checkpoint(f"Updated incumbent from restricted master at depth {depth}")
 
         if is_integral_solution(node_result.route_values):
@@ -5528,6 +5619,7 @@ def branch_and_price(
                     note="Found integral node solution",
                     node_depth=depth,
                 )
+                maybe_save_incumbent_report()
                 save_checkpoint(f"Updated incumbent from integral node at depth {depth}")
             current_node = None
             save_checkpoint(f"Fathomed integral node at depth {depth}")
@@ -5723,6 +5815,9 @@ def branch_and_price(
             note="Branch-and-price finished",
         )
 
+    if incumbent_routes:
+        maybe_save_incumbent_report(force=True)
+
     save_checkpoint(f"Branch-and-price exited with status {status}")
 
     return BranchAndPriceResult(
@@ -5754,6 +5849,7 @@ def solve_model(
     progress: ProgressTracker | None = None,
     trace_logger: ObjectiveTraceLogger | None = None,
     checkpoint_manager: CheckpointManager | None = None,
+    incumbent_report_writer: IncumbentReportWriter | None = None,
     resume_from: Path | None = None,
 ) -> BranchAndPriceResult:
     instance = load_instance(workbook_path)
@@ -5774,6 +5870,7 @@ def solve_model(
         progress=progress,
         trace_logger=trace_logger,
         checkpoint_manager=checkpoint_manager,
+        incumbent_report_writer=incumbent_report_writer,
         resume_from=resume_from,
     )
 
@@ -5999,12 +6096,22 @@ def parse_args() -> argparse.Namespace:
         help="Disable writing the objective trace CSV.",
     )
     parser.add_argument(
-        "--interrupt-report-path",
+        "--incumbent-report-path",
         type=Path,
         default=None,
         help=(
-            "Optional text file path to write interrupt artifact locations to when the run is "
-            "stopped with Ctrl-C/SIGTERM. Default: auto-generate beside the workbook."
+            "Optional text file path for the latest human-readable incumbent route report. "
+            "The solver refreshes this file whenever the incumbent objective improves by a "
+            "meaningful amount. Default: auto-generate beside the workbook."
+        ),
+    )
+    parser.add_argument(
+        "--incumbent-report-min-improvement",
+        type=float,
+        default=DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT,
+        help=(
+            "Minimum objective decrease required before rewriting the incumbent route report. "
+            "Default: 1.0."
         ),
     )
     parser.add_argument(
@@ -6089,13 +6196,15 @@ def main() -> None:
         enabled=args.progress,
         interval_seconds=args.progress_interval,
     )
+    if args.incumbent_report_min_improvement < 0:
+        raise SystemExit("--incumbent-report-min-improvement must be non-negative.")
     objective_trace_path = (
         None
         if args.no_objective_trace
         else (args.objective_trace or default_objective_trace_path(args.workbook))
     )
-    interrupt_report_path = (
-        args.interrupt_report_path or default_interrupt_artifact_report_path(args.workbook)
+    incumbent_report_path = (
+        args.incumbent_report_path or default_incumbent_report_path(args.workbook)
     )
     checkpoint_path = (args.checkpoint_path or args.resume_from) if route_based_enabled else None
     checkpoint_manager = CheckpointManager(checkpoint_path)
@@ -6105,6 +6214,10 @@ def main() -> None:
         else MIPPersistenceManager(args.mip_persist_dir or default_mip_persist_dir(args.workbook))
     )
     trace_logger = ObjectiveTraceLogger(objective_trace_path, args.workbook)
+    incumbent_report_writer = IncumbentReportWriter(
+        incumbent_report_path,
+        min_improvement=args.incumbent_report_min_improvement,
+    )
     try:
         configured_wls_license = resolve_gurobi_wls_license()
     except ValueError as exc:
@@ -6123,6 +6236,8 @@ def main() -> None:
         if checkpoint_manager.path is not None:
             record_interrupt_artifact("checkpoint", checkpoint_manager.path)
             print(f"Checkpoint path: {checkpoint_manager.path}")
+        if incumbent_report_writer.path is not None:
+            print(f"Incumbent report: {incumbent_report_writer.path}")
         if configured_wls_license is not None:
             print("Using Gurobi WLS credentials from .env, environment variables, or fallback script settings.")
         print("Active business rules:")
@@ -6144,6 +6259,7 @@ def main() -> None:
                 progress=progress,
                 trace_logger=trace_logger,
                 checkpoint_manager=checkpoint_manager,
+                incumbent_report_writer=incumbent_report_writer,
                 resume_from=args.resume_from,
             )
         else:
@@ -6158,6 +6274,7 @@ def main() -> None:
                 progress=progress,
                 trace_logger=trace_logger,
                 persistence_manager=mip_persistence_manager,
+                incumbent_report_writer=incumbent_report_writer,
             )
     except KeyboardInterrupt:
         interrupt_note = "Interrupted by user"
@@ -6172,22 +6289,13 @@ def main() -> None:
             print(f"\n{interrupt_note}. Partial objective trace saved to {trace_logger.path}")
         if checkpoint_manager.path is not None:
             print(f"{interrupt_note}. Latest checkpoint retained at {checkpoint_manager.path}")
-        if route_based_enabled:
-            interrupt_incumbent_report_path = save_route_based_interrupt_incumbent_report(
-                args.workbook,
-                checkpoint_manager.path,
+        if incumbent_report_writer.path is not None and incumbent_report_writer.path.is_file():
+            print(
+                f"{interrupt_note}. Latest incumbent route report is at "
+                f"{incumbent_report_writer.path}"
             )
-            if interrupt_incumbent_report_path is not None:
-                record_interrupt_artifact(
-                    "interrupt_incumbent_report",
-                    interrupt_incumbent_report_path,
-                )
-                print(
-                    f"{interrupt_note}. Saved interrupt incumbent route report to "
-                    f"{interrupt_incumbent_report_path}"
-                )
         saved_interrupt_report_path = write_interrupt_artifact_report(
-            interrupt_report_path,
+            default_interrupt_artifact_report_path(args.workbook),
             workbook_path=args.workbook,
             interrupt_note=interrupt_note,
         )
