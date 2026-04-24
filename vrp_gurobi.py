@@ -3537,14 +3537,16 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                     load_after_kg[vehicle_id, next_stop]
                     >= load_after_kg[vehicle_id, stop_id]
                     + instance.stops[next_stop].demand_kg
-                    - vehicle.capacity_kg * (1 - x[vehicle_id, stop_id, next_stop]),
+                    - (vehicle.capacity_kg + instance.stops[next_stop].demand_kg)
+                    * (1 - x[vehicle_id, stop_id, next_stop]),
                     name=f"load_progress_lb[{vehicle_id},{stop_id},{next_stop}]",
                 )
                 model.addConstr(
                     load_after_kg[vehicle_id, next_stop]
                     <= load_after_kg[vehicle_id, stop_id]
                     + instance.stops[next_stop].demand_kg
-                    + vehicle.capacity_kg * (1 - x[vehicle_id, stop_id, next_stop]),
+                    + (vehicle.capacity_kg + instance.stops[next_stop].demand_kg)
+                    * (1 - x[vehicle_id, stop_id, next_stop]),
                     name=f"load_progress_ub[{vehicle_id},{stop_id},{next_stop}]",
                 )
 
