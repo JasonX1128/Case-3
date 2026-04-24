@@ -31,7 +31,9 @@ ARTIFICIAL_COVER_PENALTY = 1_000_000.0
 INITIAL_ACTIVE_COVER_CANDIDATES_PER_STOP = 3
 INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE = 12
 INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
-DEFAULT_MIP_FORMULATION_VERSION = 3
+# Bump whenever the default arc-flow MIP variable set or feasibility logic changes
+# in a way that can invalidate persisted .mst/.sol starts.
+DEFAULT_MIP_FORMULATION_VERSION = 4
 DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
 DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT = 1.0
 
@@ -2784,6 +2786,9 @@ def build_constructive_arc_flow_seed(
 def apply_constructive_arc_flow_mip_start(
     instance: Instance,
     data: dict[str, Any],
+    *,
+    model: gp.Model | None = None,
+    start_number: int | None = None,
 ) -> bool:
     assignments = build_constructive_arc_flow_seed(instance)
     if assignments is None:
@@ -2792,21 +2797,96 @@ def apply_constructive_arc_flow_mip_start(
     x = data["x"]
     visit = data["visit"]
     use_vehicle = data["use_vehicle"]
-    stop_ids = data["stop_ids"]
-    vehicle_ids = data["vehicle_ids"]
+    depart_min = data["depart_min"]
+    return_min = data["return_min"]
+    service_start_min = data["service_start_min"]
+    late_min = data["late_min"]
+    billed_hours = data["billed_hours"]
+    load_after_kg = data["load_after_kg"]
+    lunch_required = data["lunch_required"]
+    lunch_start_min = data["lunch_start_min"]
+    served_after_lunch = data["served_after_lunch"]
+    stop_ids: list[int] = data["stop_ids"]
+    previous_start_number: int | None = None
+
+    if start_number is not None:
+        if model is None:
+            raise ValueError("model is required when applying a constructive MIP start slot")
+        previous_start_number = int(model.Params.StartNumber)
+        model.Params.StartNumber = start_number
 
     for var in x.values():
-        var.Start = GRB.UNDEFINED
+        var.Start = 0.0
     for var in visit.values():
         var.Start = 0.0
     for var in use_vehicle.values():
         var.Start = 0.0
+    for var in depart_min.values():
+        var.Start = 0.0
+    for var in return_min.values():
+        var.Start = 0.0
+    for var in service_start_min.values():
+        var.Start = 0.0
+    for var in late_min.values():
+        var.Start = 0.0
+    for var in billed_hours.values():
+        var.Start = 0.0
+    for var in load_after_kg.values():
+        var.Start = 0.0
+    for var in lunch_required.values():
+        var.Start = 0.0
+    for var in lunch_start_min.values():
+        var.Start = 0.0
+    for var in served_after_lunch.values():
+        var.Start = 0.0
 
-    for vehicle_id, route, _vehicle_type in assignments:
+    assigned_service_starts: dict[int, float] = {}
+    assigned_late: dict[int, float] = {}
+
+    for vehicle_id, route, vehicle_type in assignments:
+        start_min = vehicle_start_limit(instance, vehicle_type)
+        route_with_depot = (DEPOT_NODE,) + route.stop_sequence + (DEPOT_NODE,)
         use_vehicle[vehicle_id].Start = 1.0
+        depart_min[vehicle_id].Start = start_min
+        return_min[vehicle_id].Start = route.return_min
+        billed_hours[vehicle_id].Start = float(
+            billed_operating_hours(route.return_min - start_min)
+        )
+        if route.lunch_break_start_min is not None:
+            lunch_required[vehicle_id].Start = 1.0
+            lunch_start_min[vehicle_id].Start = route.lunch_break_start_min
+        cumulative_load_kg = 0.0
         for stop_id in route.stop_sequence:
             visit[vehicle_id, stop_id].Start = 1.0
+            assigned_service_starts[stop_id] = route.service_start_min[stop_id]
+            assigned_late[stop_id] = route.late_min[stop_id]
+            cumulative_load_kg += instance.stops[stop_id].demand_kg
+            load_after_kg[vehicle_id, stop_id].Start = cumulative_load_kg
+        lunch_end_min = (
+            None
+            if route.lunch_break_start_min is None
+            else route.lunch_break_start_min + MIDDAY_LUNCH_BREAK_RULE.duration_min
+        )
+        for stop_id in route.stop_sequence:
+            if lunch_end_min is not None and route.service_start_min[stop_id] >= lunch_end_min - 1e-9:
+                served_after_lunch[vehicle_id, stop_id].Start = 1.0
+        for i, j in zip(route_with_depot, route_with_depot[1:]):
+            arc_key = (vehicle_id, i, j)
+            arc_var = x.get(arc_key)
+            if arc_var is None:
+                return False
+            arc_var.Start = 1.0
 
+    if set(assigned_service_starts) != set(stop_ids):
+        if model is not None and previous_start_number is not None:
+            model.Params.StartNumber = previous_start_number
+        return False
+    for stop_id in stop_ids:
+        service_start_min[stop_id].Start = assigned_service_starts[stop_id]
+        late_min[stop_id].Start = assigned_late[stop_id]
+
+    if model is not None and previous_start_number is not None:
+        model.Params.StartNumber = previous_start_number
     return True
 
 
@@ -3812,7 +3892,11 @@ def solve_arc_flow_model(
             loaded_start_path = persistence_manager.load_start(model, workbook_path)
         applied_constructive_seed = False
         if loaded_start_path is None:
-            applied_constructive_seed = apply_constructive_arc_flow_mip_start(instance, data)
+            applied_constructive_seed = apply_constructive_arc_flow_mip_start(
+                instance,
+                data,
+                model=model,
+            )
             if applied_constructive_seed:
                 model.Params.StartNodeLimit = max(int(getattr(model.Params, "StartNodeLimit", 0)), 5000)
                 model.update()
