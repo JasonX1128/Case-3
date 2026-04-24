@@ -108,6 +108,12 @@ HARD_STOP_SERVICE_WINDOW_RULES: tuple[StopServiceWindowRule, ...] = (
         latest_min=None,
         description="Sunrise Senior Living (Stop 14) may not be served before 10:00 AM.",
     ),
+    StopServiceWindowRule(
+        stop_id=27,
+        earliest_min=12.0 * 60.0,
+        latest_min=None,
+        description="Redstone Elementary School (Stop 27) may not be served before 12:00 PM.",
+    ),
 )
 HARD_STOP_SERVICE_WINDOW_RULE_BY_STOP = {
     rule.stop_id: rule for rule in HARD_STOP_SERVICE_WINDOW_RULES
