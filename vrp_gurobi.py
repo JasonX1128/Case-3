@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import heapq
 import json
 import math
@@ -10,6 +11,8 @@ import os
 import re
 import shutil
 import signal
+import subprocess
+import sys
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -21,6 +24,11 @@ from typing import Any, Callable
 import gurobipy as gp
 from gurobipy import GRB
 from openpyxl import load_workbook
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional acceleration
+    np = None
 
 
 DEPOT_NODE = 0
@@ -34,14 +42,105 @@ INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
 ROOT_PRICING_COLUMNS_MIN = 30
 ROOT_PRICING_COLUMNS_MULTIPLIER = 10
 EXACT_PRICING_FALLBACK_MAX_ROUTES = 1
+ROOT_EXACT_PRICING_FALLBACK_MAX_ROUTES = 8
 HEURISTIC_PRICING_SINGLETON_SEED_LIMIT = 40
 HEURISTIC_PRICING_BEAM_WIDTH = 8
 ROUTE_BASED_PARTIAL_PRICING = True
+ROOT_BOOTSTRAP_MAX_ITERATIONS = 200
+ROOT_BOOTSTRAP_MAX_SECONDS = 8.0
+ROOT_BOOTSTRAP_TIME_FRACTION = 0.20
+ROOT_BOOTSTRAP_ROUTES_PER_TYPE = 18
+ROOT_PRICING_EXTRA_SWEEPS = 8
+ROOT_PRICING_TARGET_NEW_ROUTES_PER_LP = 24
+EXACT_PRICING_NATIVE_MIN_BUCKET_SIZE = 8
+EXACT_PRICING_NUMPY_MIN_BUCKET_SIZE = 16
 # Bump whenever the default arc-flow MIP variable set or feasibility logic changes
 # in a way that can invalidate persisted .mst/.sol starts.
 DEFAULT_MIP_FORMULATION_VERSION = 4
 DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
 DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT = 1.0
+_NATIVE_PRICING_HELPER: Any | None | bool = None
+
+
+def native_pricing_helper() -> Any | None:
+    global _NATIVE_PRICING_HELPER
+    if _NATIVE_PRICING_HELPER is False:
+        return None
+    if _NATIVE_PRICING_HELPER is not None:
+        return _NATIVE_PRICING_HELPER
+    if np is None:
+        _NATIVE_PRICING_HELPER = False
+        return None
+
+    source_path = Path(__file__).with_name("native_pricing_helper.c")
+    if not source_path.is_file():
+        _NATIVE_PRICING_HELPER = False
+        return None
+
+    cache_dir = Path(__file__).resolve().parent / ".native_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    binary_path = cache_dir / f"{source_path.stem}{suffix}"
+
+    try:
+        rebuild_required = (
+            not binary_path.is_file()
+            or binary_path.stat().st_mtime < source_path.stat().st_mtime
+        )
+    except OSError:
+        rebuild_required = True
+
+    if rebuild_required:
+        temp_binary_path = binary_path.with_name(
+            f"{binary_path.stem}.{os.getpid()}{binary_path.suffix}"
+        )
+        compile_command = [os.environ.get("CC", "cc"), "-O3", "-std=c99"]
+        if sys.platform == "darwin":
+            compile_command.extend(["-dynamiclib", "-o", str(temp_binary_path)])
+        else:
+            compile_command.extend(["-shared", "-fPIC", "-o", str(temp_binary_path)])
+        compile_command.append(str(source_path))
+        try:
+            subprocess.run(
+                compile_command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            os.replace(temp_binary_path, binary_path)
+        except Exception:
+            temp_binary_path.unlink(missing_ok=True)
+            if not binary_path.is_file():
+                _NATIVE_PRICING_HELPER = False
+                return None
+
+    try:
+        library = ctypes.CDLL(str(binary_path))
+        function = library.pricing_dominance_scan
+        function.argtypes = [
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_uint64,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        function.restype = ctypes.c_int
+    except Exception:
+        _NATIVE_PRICING_HELPER = False
+        return None
+
+    _NATIVE_PRICING_HELPER = function
+    return function
 
 # ============================================================================
 # Hardcoded business rules
@@ -515,6 +614,10 @@ class PricingLabelBucket:
     max_time_after_service: float
     max_load_kg: float
     max_nonlabor_reduced_cost: float
+    union_visited_mask: int
+    intersection_visited_mask: int
+    cached_index_array: Any | None
+    cache_dirty: bool
 
 
 class ProgressTracker:
@@ -2098,6 +2201,166 @@ def select_inactive_reactivation_routes(
         )
         selected_routes.extend(route for _, route in improving_routes[:max_per_type])
     return selected_routes
+
+
+def root_bootstrap_time_limit(deadline: float | None) -> float | None:
+    if deadline is None:
+        return ROOT_BOOTSTRAP_MAX_SECONDS
+    remaining = remaining_time(deadline)
+    if remaining is None or remaining <= 0:
+        return 0.0
+    return min(
+        ROOT_BOOTSTRAP_MAX_SECONDS,
+        max(remaining * ROOT_BOOTSTRAP_TIME_FRACTION, 0.0),
+    )
+
+
+def bootstrap_root_route_pool(
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+    route_pool: list[RouteColumn],
+    route_key_set: set[tuple[str, tuple[int, ...]]],
+    branch_state: BranchState,
+    deadline: float | None,
+    progress: ProgressTracker | None = None,
+) -> int:
+    bootstrap_time_limit = root_bootstrap_time_limit(deadline)
+    if (
+        bootstrap_time_limit is None
+        or bootstrap_time_limit <= 0.0
+        or ROOT_BOOTSTRAP_MAX_ITERATIONS <= 0
+        or ROOT_BOOTSTRAP_ROUTES_PER_TYPE <= 0
+    ):
+        return 0
+
+    branch_ctx = build_branch_context(branch_state, instance, vehicle_types)
+    if branch_ctx is None:
+        return 0
+
+    compatible_routes = [route for route in route_pool if route_is_compatible(route, branch_ctx)]
+    if not compatible_routes:
+        return 0
+
+    route_sequences_by_type: dict[str, set[tuple[int, ...]]] = {
+        type_id: set() for type_id in vehicle_types
+    }
+    for type_id, stop_sequence in route_key_set:
+        if type_id in route_sequences_by_type:
+            route_sequences_by_type[type_id].add(stop_sequence)
+
+    bootstrap_deadline = perf_counter() + bootstrap_time_limit
+    node_master = build_incremental_node_master(
+        instance=instance,
+        vehicle_types=vehicle_types,
+        routes=compatible_routes,
+    )
+    added_route_count = 0
+
+    if progress is not None:
+        progress.emit(
+            "root bootstrap: starting heuristic column harvest over "
+            f"{len(compatible_routes)} columns for up to {bootstrap_time_limit:.1f}s",
+            force=True,
+        )
+
+    for bootstrap_iteration in range(1, ROOT_BOOTSTRAP_MAX_ITERATIONS + 1):
+        bootstrap_remaining = remaining_time(bootstrap_deadline)
+        overall_remaining = remaining_time(deadline)
+        effective_time_limit = bootstrap_remaining
+        if overall_remaining is not None:
+            effective_time_limit = (
+                min(overall_remaining, bootstrap_remaining)
+                if bootstrap_remaining is not None
+                else overall_remaining
+            )
+        if effective_time_limit is not None and effective_time_limit <= 0:
+            break
+
+        if effective_time_limit is not None:
+            node_master.model.Params.TimeLimit = effective_time_limit
+
+        optimize_with_heartbeat(
+            node_master.model,
+            progress=progress,
+            label=f"root bootstrap LP iteration {bootstrap_iteration}",
+        )
+        if node_master.model.Status != GRB.OPTIMAL:
+            break
+
+        cover_duals = {
+            stop_id: node_master.cover_constraints[stop_id].Pi
+            for stop_id in sorted(instance.stops)
+        }
+        type_duals = {
+            type_id: node_master.type_constraints[type_id].Pi for type_id in vehicle_types
+        }
+
+        new_routes: list[RouteColumn] = []
+        bootstrap_timed_out = False
+        for vehicle_type in vehicle_types.values():
+            try:
+                candidate_routes = solve_pricing_subproblem(
+                    instance=instance,
+                    vehicle_type=vehicle_type,
+                    cover_duals=cover_duals,
+                    type_dual=type_duals[vehicle_type.type_id],
+                    branch_ctx=branch_ctx,
+                    max_routes=ROOT_BOOTSTRAP_ROUTES_PER_TYPE,
+                    excluded_stop_sequences=route_sequences_by_type[vehicle_type.type_id],
+                    pricing_time_limit=None,
+                    deadline=bootstrap_deadline,
+                    progress=progress,
+                    progress_label=f"root bootstrap pricing {vehicle_type.type_id}",
+                    exact_fallback_max_routes=ROOT_EXACT_PRICING_FALLBACK_MAX_ROUTES,
+                )
+            except TimeoutError:
+                bootstrap_timed_out = True
+                break
+            for route in candidate_routes:
+                if (
+                    route_reduced_cost(
+                        route,
+                        cover_duals=cover_duals,
+                        type_dual=type_duals[vehicle_type.type_id],
+                    )
+                    >= -REDUCED_COST_TOL
+                ):
+                    continue
+                key = route_column_key(route)
+                if key in route_key_set:
+                    continue
+                route_key_set.add(key)
+                route_sequences_by_type[route.type_id].add(route.stop_sequence)
+                route_pool.append(route)
+                new_routes.append(route)
+                add_route_column_to_master(node_master, route)
+
+        if bootstrap_timed_out:
+            if progress is not None:
+                progress.emit(
+                    "root bootstrap: stopped early after hitting the bootstrap time budget",
+                    force=True,
+                )
+            break
+
+        if not new_routes:
+            if progress is not None:
+                progress.emit(
+                    f"root bootstrap: converged after {bootstrap_iteration} LP rounds "
+                    "with no new heuristic routes",
+                    force=True,
+                )
+            break
+
+        added_route_count += len(new_routes)
+        if progress is not None:
+            progress.emit(
+                f"root bootstrap: iteration {bootstrap_iteration} added {len(new_routes)} routes; "
+                f"route pool now has {len(route_pool)} columns",
+                force=True,
+            )
+
+    return added_route_count
 
 
 def init_pricing_worker(instance: Instance, branch_ctx: BranchContext) -> None:
@@ -4608,6 +4871,7 @@ def solve_pricing_subproblem(
     deadline: float | None,
     progress: ProgressTracker | None = None,
     progress_label: str | None = None,
+    exact_fallback_max_routes: int | None = None,
 ) -> list[RouteColumn]:
     if max_routes <= 0:
         return []
@@ -4627,7 +4891,12 @@ def solve_pricing_subproblem(
                 f"found {len(heuristic_routes)} improving route(s); skipping exact labeling"
             )
         return heuristic_routes
-    exact_max_routes = min(max_routes, EXACT_PRICING_FALLBACK_MAX_ROUTES)
+    fallback_route_limit = (
+        EXACT_PRICING_FALLBACK_MAX_ROUTES
+        if exact_fallback_max_routes is None
+        else exact_fallback_max_routes
+    )
+    exact_max_routes = min(max_routes, fallback_route_limit)
     if progress is not None and exact_max_routes < max_routes:
         progress.emit(
             f"{progress_label or f'pricing {vehicle_type.type_id}'}: heuristic pricing found "
@@ -4727,6 +4996,36 @@ def solve_pricing_subproblem(
     positive_dual_stops = [
         stop_id for stop_id in stop_ids if positive_cover_duals[stop_id] > REDUCED_COST_TOL
     ]
+    positive_dual_stop_items = [
+        (
+            stop_id,
+            stop_mask[stop_id],
+            positive_cover_duals[stop_id],
+            instance.stops[stop_id].demand_kg,
+            instance.stops[stop_id].service_min,
+        )
+        for stop_id in positive_dual_stops
+    ]
+    positive_dual_density_order = sorted(
+        positive_dual_stop_items,
+        key=lambda item: (
+            item[2] / max(item[3], 1e-9),
+            item[2],
+            -instance.stops[item[0]].latest_min,
+            item[0],
+        ),
+        reverse=True,
+    )
+    positive_dual_service_order = sorted(
+        positive_dual_stop_items,
+        key=lambda item: (
+            item[2] / max(item[4], 1e-9),
+            item[2],
+            -instance.stops[item[0]].latest_min,
+            item[0],
+        ),
+        reverse=True,
+    )
     group_mask_list = sorted(together_group_masks)
     stop_bit_pairs = [(stop_id, stop_mask[stop_id]) for stop_id in stop_ids]
     mask_resource_cache: dict[int, tuple[float, float]] = {}
@@ -4792,8 +5091,80 @@ def solve_pricing_subproblem(
     label_store: list[PricingLabel] = []
     label_alive: list[bool] = []
     labels_by_state: dict[
-        tuple[int, bool, int, int], dict[int, PricingLabelBucket]
-    ] = defaultdict(dict)
+        tuple[int, bool, int, int], list[PricingLabelBucket | None]
+    ] = {}
+    numpy_acceleration_enabled = np is not None
+    native_dominance_helper = native_pricing_helper() if numpy_acceleration_enabled else None
+    native_acceleration_enabled = native_dominance_helper is not None
+    if numpy_acceleration_enabled:
+        label_capacity = 1024
+        label_time_array = np.empty(label_capacity, dtype=np.float64)
+        label_load_array = np.empty(label_capacity, dtype=np.float64)
+        label_nonlabor_array = np.empty(label_capacity, dtype=np.float64)
+        label_visited_mask_array = np.empty(label_capacity, dtype=np.uint64)
+        label_alive_array = np.zeros(label_capacity, dtype=np.uint8)
+        survivor_index_buffer = np.empty(label_capacity, dtype=np.int32)
+
+        def ensure_label_capacity(required_size: int) -> None:
+            nonlocal label_capacity, label_time_array, label_load_array
+            nonlocal label_nonlabor_array, label_visited_mask_array, label_alive_array
+            nonlocal survivor_index_buffer
+            if required_size <= label_capacity:
+                return
+            new_capacity = label_capacity
+            while new_capacity < required_size:
+                new_capacity *= 2
+            new_time_array = np.empty(new_capacity, dtype=np.float64)
+            new_time_array[: len(label_store)] = label_time_array[: len(label_store)]
+            label_time_array = new_time_array
+            new_load_array = np.empty(new_capacity, dtype=np.float64)
+            new_load_array[: len(label_store)] = label_load_array[: len(label_store)]
+            label_load_array = new_load_array
+            new_nonlabor_array = np.empty(new_capacity, dtype=np.float64)
+            new_nonlabor_array[: len(label_store)] = label_nonlabor_array[: len(label_store)]
+            label_nonlabor_array = new_nonlabor_array
+            new_mask_array = np.empty(new_capacity, dtype=np.uint64)
+            new_mask_array[: len(label_store)] = label_visited_mask_array[: len(label_store)]
+            label_visited_mask_array = new_mask_array
+            new_alive_array = np.zeros(new_capacity, dtype=np.uint8)
+            new_alive_array[: len(label_store)] = label_alive_array[: len(label_store)]
+            label_alive_array = new_alive_array
+            new_survivor_buffer = np.empty(new_capacity, dtype=np.int32)
+            new_survivor_buffer[: len(label_store)] = survivor_index_buffer[: len(label_store)]
+            survivor_index_buffer = new_survivor_buffer
+            label_capacity = new_capacity
+
+        def bucket_index_array(bucket: PricingLabelBucket) -> Any:
+            if bucket.cached_index_array is None or bucket.cache_dirty:
+                if bucket.label_indices:
+                    bucket.cached_index_array = np.asarray(bucket.label_indices, dtype=np.int32)
+                else:
+                    bucket.cached_index_array = np.empty(0, dtype=np.int32)
+                bucket.cache_dirty = False
+            return bucket.cached_index_array
+
+        def refresh_bucket_from_indices(
+            bucket: PricingLabelBucket,
+            survivor_indices: Any,
+        ) -> bool:
+            if survivor_indices.size == 0:
+                return False
+            time_values = label_time_array[survivor_indices]
+            load_values = label_load_array[survivor_indices]
+            nonlabor_values = label_nonlabor_array[survivor_indices]
+            mask_values = label_visited_mask_array[survivor_indices]
+            bucket.label_indices = survivor_indices.tolist()
+            bucket.cached_index_array = survivor_indices
+            bucket.cache_dirty = False
+            bucket.min_time_after_service = float(time_values.min())
+            bucket.min_load_kg = float(load_values.min())
+            bucket.min_nonlabor_reduced_cost = float(nonlabor_values.min())
+            bucket.max_time_after_service = float(time_values.max())
+            bucket.max_load_kg = float(load_values.max())
+            bucket.max_nonlabor_reduced_cost = float(nonlabor_values.max())
+            bucket.union_visited_mask = int(np.bitwise_or.reduce(mask_values))
+            bucket.intersection_visited_mask = int(np.bitwise_and.reduce(mask_values))
+            return True
     frontier: list[tuple[float, float, int]] = []
     explored_labels = 0
 
@@ -4816,6 +5187,18 @@ def solve_pricing_subproblem(
             return None
         _, break_end = lunch_window
         return (break_end - label.time_after_service) + travel_to_depot
+
+    def lunch_can_fit_during_wait(arrival_min: float, service_start_min: float) -> bool:
+        if MIDDAY_LUNCH_BREAK_RULE is None:
+            return False
+        if service_start_min - arrival_min < MIDDAY_LUNCH_BREAK_RULE.duration_min - 1e-9:
+            return False
+        earliest_lunch_start = max(arrival_min, MIDDAY_LUNCH_BREAK_RULE.window_start_min)
+        latest_lunch_start = min(
+            service_start_min - MIDDAY_LUNCH_BREAK_RULE.duration_min,
+            MIDDAY_LUNCH_BREAK_RULE.latest_start_min,
+        )
+        return earliest_lunch_start <= latest_lunch_start + 1e-9
 
     def label_state_key(label: PricingLabel) -> tuple[int, bool, int, int]:
         pending_partner = pending_required_adjacent_partner(label)
@@ -4880,9 +5263,34 @@ def solve_pricing_subproblem(
             optimistic_reward_cache[cache_key] = 0.0
             return 0.0
 
-        reward = 0.0
-        for stop_id in positive_dual_stops:
-            stop_bit = stop_mask[stop_id]
+        mandatory_info = mandatory_remainder_info(label)
+        if mandatory_info is None:
+            optimistic_reward_cache[cache_key] = 0.0
+            return 0.0
+        requirement_mask, requirement_demand, _ = mandatory_info
+
+        mandatory_reward = 0.0
+        residual_capacity = vehicle_type.capacity_kg - label.load_kg
+        if residual_capacity <= 1e-9:
+            optimistic_reward_cache[cache_key] = 0.0
+            return 0.0
+
+        optional_capacity = max(residual_capacity - requirement_demand, 0.0)
+        mandatory_requirement_time = mandatory_info[2]
+        if (
+            MIDDAY_LUNCH_BREAK_RULE is not None
+            and not label.lunch_break_taken
+            and label.time_after_service + mandatory_requirement_time
+            > MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9
+        ):
+            mandatory_requirement_time += MIDDAY_LUNCH_BREAK_RULE.duration_min
+        optional_service_time = max(
+            end_limit - label.time_after_service - mandatory_requirement_time,
+            0.0,
+        )
+
+        optional_mask = 0
+        for stop_id, stop_bit, dual_reward, _, _ in positive_dual_stop_items:
             if label.visited_mask & stop_bit:
                 continue
             if separated_mask_by_stop[stop_id] & label.visited_mask:
@@ -4895,7 +5303,42 @@ def solve_pricing_subproblem(
                 and label.visited_mask & stop_mask[forced_pred]
             ):
                 continue
-            reward += positive_cover_duals[stop_id]
+
+            if requirement_mask & stop_bit:
+                mandatory_reward += dual_reward
+                continue
+
+            optional_mask |= stop_bit
+
+        optional_capacity_reward = 0.0
+        if optional_capacity > 1e-9 and optional_mask:
+            for stop_id, stop_bit, dual_reward, demand, _ in positive_dual_density_order:
+                if not optional_mask & stop_bit:
+                    continue
+                if demand <= optional_capacity + 1e-9:
+                    optional_capacity_reward += dual_reward
+                    optional_capacity -= demand
+                    continue
+                optional_capacity_reward += dual_reward * (optional_capacity / max(demand, 1e-9))
+                optional_capacity = 0.0
+                break
+
+        optional_service_reward = 0.0
+        if optional_service_time > 1e-9 and optional_mask:
+            for stop_id, stop_bit, dual_reward, _, service_min in positive_dual_service_order:
+                if not optional_mask & stop_bit:
+                    continue
+                if service_min <= optional_service_time + 1e-9:
+                    optional_service_reward += dual_reward
+                    optional_service_time -= service_min
+                    continue
+                optional_service_reward += dual_reward * (
+                    optional_service_time / max(service_min, 1e-9)
+                )
+                optional_service_time = 0.0
+                break
+
+        reward = mandatory_reward + min(optional_capacity_reward, optional_service_reward)
 
         optimistic_reward_cache[cache_key] = reward
         return reward
@@ -4985,11 +5428,18 @@ def solve_pricing_subproblem(
         label_mask = label.visited_mask
         label_alive_local = label_alive
         label_store_local = label_store
+        if numpy_acceleration_enabled:
+            label_mask_u64 = np.uint64(label_mask)
+            not_label_mask_u64 = np.bitwise_not(label_mask_u64)
         state_key = label_state_key(label)
         visited_count = label.visited_mask.bit_count()
-        state_buckets = labels_by_state[state_key]
-        for incumbent_count in sorted(tuple(state_buckets)):
-            incumbent_bucket = state_buckets[incumbent_count]
+        state_buckets = labels_by_state.get(state_key)
+        if state_buckets is None:
+            state_buckets = [None] * (len(stop_ids) + 1)
+            labels_by_state[state_key] = state_buckets
+        for incumbent_count, incumbent_bucket in enumerate(state_buckets):
+            if incumbent_bucket is None:
+                continue
             incumbent_can_dominate = incumbent_count <= visited_count
             label_can_dominate = incumbent_count >= visited_count
             if incumbent_can_dominate and (
@@ -4997,6 +5447,7 @@ def solve_pricing_subproblem(
                 or incumbent_bucket.min_load_kg > label_load + 1e-9
                 or incumbent_bucket.min_nonlabor_reduced_cost
                 > label_nonlabor + 1e-9
+                or (incumbent_bucket.intersection_visited_mask & ~label_mask) != 0
             ):
                 incumbent_can_dominate = False
             if label_can_dominate and (
@@ -5004,10 +5455,139 @@ def solve_pricing_subproblem(
                 or incumbent_bucket.max_load_kg < label_load - 1e-9
                 or incumbent_bucket.max_nonlabor_reduced_cost
                 < label_nonlabor - 1e-9
+                or (label_mask & ~incumbent_bucket.union_visited_mask) != 0
             ):
                 label_can_dominate = False
             if not incumbent_can_dominate and not label_can_dominate:
                 continue
+            use_numpy_bucket = (
+                numpy_acceleration_enabled
+                and len(incumbent_bucket.label_indices) >= EXACT_PRICING_NUMPY_MIN_BUCKET_SIZE
+            )
+            use_native_bucket = (
+                native_acceleration_enabled
+                and len(incumbent_bucket.label_indices) >= EXACT_PRICING_NATIVE_MIN_BUCKET_SIZE
+            )
+            if use_native_bucket:
+                idx_array = bucket_index_array(incumbent_bucket)
+                if idx_array.size == 0:
+                    state_buckets[incumbent_count] = None
+                    continue
+
+                survivor_count = ctypes.c_size_t(0)
+                incumbent_dominates = native_dominance_helper(
+                    idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                    idx_array.size,
+                    label_time_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                    label_load_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                    label_nonlabor_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                    label_visited_mask_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                    label_alive_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                    label_time,
+                    label_load,
+                    label_nonlabor,
+                    ctypes.c_uint64(label_mask),
+                    int(incumbent_can_dominate),
+                    int(label_can_dominate),
+                    survivor_index_buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.byref(survivor_count),
+                )
+                if incumbent_dominates:
+                    return None
+
+                survivor_total = survivor_count.value
+                if survivor_total != idx_array.size:
+                    removed_indices = idx_array[label_alive_array[idx_array] == 0]
+                    for removed_idx in removed_indices.tolist():
+                        label_alive_local[removed_idx] = False
+                    survivor_indices = survivor_index_buffer[:survivor_total].copy()
+                    if not refresh_bucket_from_indices(incumbent_bucket, survivor_indices):
+                        state_buckets[incumbent_count] = None
+                continue
+            if use_numpy_bucket:
+                idx_array = bucket_index_array(incumbent_bucket)
+                if idx_array.size == 0:
+                    state_buckets[incumbent_count] = None
+                    continue
+
+                alive_mask = label_alive_array[idx_array] != 0
+                if not bool(np.all(alive_mask)):
+                    survivor_indices = idx_array[alive_mask]
+                    if not refresh_bucket_from_indices(incumbent_bucket, survivor_indices):
+                        state_buckets[incumbent_count] = None
+                        continue
+                    idx_array = survivor_indices
+
+                incumbent_times = label_time_array[idx_array]
+                incumbent_loads = label_load_array[idx_array]
+                incumbent_nonlabor = label_nonlabor_array[idx_array]
+                incumbent_masks = label_visited_mask_array[idx_array]
+
+                if incumbent_can_dominate:
+                    incumbent_dominates_mask = (
+                        (incumbent_times <= label_time + 1e-9)
+                        & (incumbent_loads <= label_load + 1e-9)
+                        & (incumbent_nonlabor <= label_nonlabor + 1e-9)
+                        & (np.bitwise_and(incumbent_masks, not_label_mask_u64) == 0)
+                    )
+                    if bool(np.any(incumbent_dominates_mask)):
+                        return None
+
+                if label_can_dominate:
+                    label_dominates_mask = (
+                        (label_time <= incumbent_times + 1e-9)
+                        & (label_load <= incumbent_loads + 1e-9)
+                        & (label_nonlabor <= incumbent_nonlabor + 1e-9)
+                        & (
+                            np.bitwise_and(
+                                label_mask_u64,
+                                np.bitwise_not(incumbent_masks),
+                            )
+                            == 0
+                        )
+                    )
+                    if bool(np.any(label_dominates_mask)):
+                        dominated_indices = idx_array[label_dominates_mask]
+                        label_alive_array[dominated_indices] = 0
+                        for dominated_idx in dominated_indices.tolist():
+                            label_alive_local[dominated_idx] = False
+                        survivor_indices = idx_array[~label_dominates_mask]
+                        if not refresh_bucket_from_indices(incumbent_bucket, survivor_indices):
+                            state_buckets[incumbent_count] = None
+                continue
+            if incumbent_can_dominate and not label_can_dominate:
+                bucket_needs_rebuild = False
+                for idx in incumbent_bucket.label_indices:
+                    if not label_alive_local[idx]:
+                        bucket_needs_rebuild = True
+                        break
+                    incumbent = label_store_local[idx]
+                    if (
+                        incumbent.time_after_service <= label_time + 1e-9
+                        and incumbent.load_kg <= label_load + 1e-9
+                        and incumbent.nonlabor_reduced_cost <= label_nonlabor + 1e-9
+                        and (incumbent.visited_mask & ~label_mask) == 0
+                    ):
+                        return None
+                if not bucket_needs_rebuild:
+                    continue
+            elif label_can_dominate and not incumbent_can_dominate:
+                bucket_needs_rebuild = False
+                for idx in incumbent_bucket.label_indices:
+                    if not label_alive_local[idx]:
+                        bucket_needs_rebuild = True
+                        break
+                    incumbent = label_store_local[idx]
+                    if (
+                        label_time <= incumbent.time_after_service + 1e-9
+                        and label_load <= incumbent.load_kg + 1e-9
+                        and label_nonlabor <= incumbent.nonlabor_reduced_cost + 1e-9
+                        and (label_mask & ~incumbent.visited_mask) == 0
+                    ):
+                        label_alive_local[idx] = False
+                        bucket_needs_rebuild = True
+                if not bucket_needs_rebuild:
+                    continue
 
             surviving_bucket: list[int] = []
             bucket_min_time = float("inf")
@@ -5016,6 +5596,9 @@ def solve_pricing_subproblem(
             bucket_max_time = -float("inf")
             bucket_max_load = -float("inf")
             bucket_max_nonlabor = -float("inf")
+            bucket_union_mask = 0
+            bucket_intersection_mask = 0
+            first_survivor = True
             bucket_changed = False
             for idx in incumbent_bucket.label_indices:
                 if not label_alive_local[idx]:
@@ -5053,6 +5636,13 @@ def solve_pricing_subproblem(
                     bucket_max_load = incumbent.load_kg
                 if incumbent.nonlabor_reduced_cost > bucket_max_nonlabor:
                     bucket_max_nonlabor = incumbent.nonlabor_reduced_cost
+                if first_survivor:
+                    bucket_union_mask = incumbent.visited_mask
+                    bucket_intersection_mask = incumbent.visited_mask
+                    first_survivor = False
+                else:
+                    bucket_union_mask |= incumbent.visited_mask
+                    bucket_intersection_mask &= incumbent.visited_mask
             if surviving_bucket:
                 if bucket_changed:
                     state_buckets[incumbent_count] = PricingLabelBucket(
@@ -5063,14 +5653,30 @@ def solve_pricing_subproblem(
                         max_time_after_service=bucket_max_time,
                         max_load_kg=bucket_max_load,
                         max_nonlabor_reduced_cost=bucket_max_nonlabor,
+                        union_visited_mask=bucket_union_mask,
+                        intersection_visited_mask=bucket_intersection_mask,
+                        cached_index_array=(
+                            np.asarray(surviving_bucket, dtype=np.int32)
+                            if numpy_acceleration_enabled
+                            else None
+                        ),
+                        cache_dirty=False,
                     )
             else:
-                del state_buckets[incumbent_count]
+                state_buckets[incumbent_count] = None
 
         label_idx = len(label_store)
+        if numpy_acceleration_enabled:
+            ensure_label_capacity(label_idx + 1)
         label_store.append(label)
         label_alive.append(True)
-        current_bucket = state_buckets.get(visited_count)
+        if numpy_acceleration_enabled:
+            label_time_array[label_idx] = label_time
+            label_load_array[label_idx] = label_load
+            label_nonlabor_array[label_idx] = label_nonlabor
+            label_visited_mask_array[label_idx] = label_mask_u64
+            label_alive_array[label_idx] = 1
+        current_bucket = state_buckets[visited_count]
         if current_bucket is None:
             state_buckets[visited_count] = PricingLabelBucket(
                 label_indices=[label_idx],
@@ -5080,6 +5686,12 @@ def solve_pricing_subproblem(
                 max_time_after_service=label.time_after_service,
                 max_load_kg=label.load_kg,
                 max_nonlabor_reduced_cost=label.nonlabor_reduced_cost,
+                union_visited_mask=label_mask,
+                intersection_visited_mask=label_mask,
+                cached_index_array=(
+                    np.asarray([label_idx], dtype=np.int32) if numpy_acceleration_enabled else None
+                ),
+                cache_dirty=False,
             )
         else:
             current_bucket.label_indices.append(label_idx)
@@ -5095,6 +5707,16 @@ def solve_pricing_subproblem(
                 current_bucket.max_load_kg = label.load_kg
             if label.nonlabor_reduced_cost > current_bucket.max_nonlabor_reduced_cost:
                 current_bucket.max_nonlabor_reduced_cost = label.nonlabor_reduced_cost
+            current_bucket.union_visited_mask |= label_mask
+            current_bucket.intersection_visited_mask &= label_mask
+            if numpy_acceleration_enabled:
+                if current_bucket.cached_index_array is not None and not current_bucket.cache_dirty:
+                    current_bucket.cached_index_array = np.append(
+                        current_bucket.cached_index_array,
+                        np.int32(label_idx),
+                    )
+                else:
+                    current_bucket.cache_dirty = True
         heapq.heappush(frontier, (optimistic_lb, label.reduced_cost, label_idx))
         return label_idx
 
@@ -5176,14 +5798,19 @@ def solve_pricing_subproblem(
         service_start = hard_service_start_after_arrival(start_stop, arrival)
         time_after_service = service_start + stop.service_min
         start_transition_options: list[tuple[bool, float, float]] = []
-        if (
-            MIDDAY_LUNCH_BREAK_RULE is None
-            or time_after_service <= MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9
-        ):
+        if MIDDAY_LUNCH_BREAK_RULE is None:
+            start_transition_options.append((False, service_start, time_after_service))
+        elif lunch_can_fit_during_wait(arrival, service_start):
+            start_transition_options.append((True, service_start, time_after_service))
+        elif time_after_service <= MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9:
             start_transition_options.append((False, service_start, time_after_service))
 
         lunch_window = lunch_break_interval_after(start_limit)
-        if MIDDAY_LUNCH_BREAK_RULE is not None and lunch_window is not None:
+        if (
+            MIDDAY_LUNCH_BREAK_RULE is not None
+            and lunch_window is not None
+            and not lunch_can_fit_during_wait(arrival, service_start)
+        ):
             _, break_end = lunch_window
             lunch_arrival = break_end + instance.travel_minutes[DEPOT_NODE, start_stop]
             lunch_service_start = hard_service_start_after_arrival(start_stop, lunch_arrival)
@@ -5247,11 +5874,7 @@ def solve_pricing_subproblem(
             arrival = label.time_after_service + instance.travel_minutes[label.node, next_stop]
             service_start = hard_service_start_after_arrival(next_stop, arrival)
             time_after_service = service_start + next_stop_data.service_min
-            if (
-                MIDDAY_LUNCH_BREAK_RULE is None
-                or label.lunch_break_taken
-                or time_after_service <= MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9
-            ):
+            if MIDDAY_LUNCH_BREAK_RULE is None or label.lunch_break_taken:
                 transition_options.append(
                     (
                         label.lunch_break_taken,
@@ -5260,8 +5883,30 @@ def solve_pricing_subproblem(
                         time_after_service - label.time_after_service,
                     )
                 )
+            elif lunch_can_fit_during_wait(arrival, service_start):
+                transition_options.append(
+                    (
+                        True,
+                        service_start,
+                        time_after_service,
+                        time_after_service - label.time_after_service,
+                    )
+                )
+            elif time_after_service <= MIDDAY_LUNCH_BREAK_RULE.latest_start_min + 1e-9:
+                transition_options.append(
+                    (
+                        False,
+                        service_start,
+                        time_after_service,
+                        time_after_service - label.time_after_service,
+                    )
+                )
 
-            if MIDDAY_LUNCH_BREAK_RULE is not None and not label.lunch_break_taken:
+            if (
+                MIDDAY_LUNCH_BREAK_RULE is not None
+                and not label.lunch_break_taken
+                and not lunch_can_fit_during_wait(arrival, service_start)
+            ):
                 lunch_window = lunch_break_interval_after(label.time_after_service)
                 if lunch_window is not None:
                     _, break_end = lunch_window
@@ -5489,11 +6134,14 @@ def solve_node_relaxation(
         route_column_key(route): route for route in compatible_routes
     }
     if resume_state is None:
-        active_routes = select_initial_active_routes(
-            instance=instance,
-            vehicle_types=vehicle_types,
-            compatible_routes=compatible_routes,
-        )
+        if node_label in {"root", "node depth 0"}:
+            active_routes = compatible_routes[:]
+        else:
+            active_routes = select_initial_active_routes(
+                instance=instance,
+                vehicle_types=vehicle_types,
+                compatible_routes=compatible_routes,
+            )
         if not active_routes:
             active_routes = compatible_routes[:]
         last_lp_objective = float("nan")
@@ -5576,12 +6224,13 @@ def solve_node_relaxation(
         if key not in active_route_keys:
             inactive_routes_by_type[route.type_id][key] = route
 
+    root_full_pricing = node_label in {"root", "node depth 0"}
     effective_pricing_workers = (
         min(pricing_workers, len(vehicle_types))
         if pricing_workers is not None
         else min(os.cpu_count() or 1, len(vehicle_types))
     )
-    if ROUTE_BASED_PARTIAL_PRICING:
+    if ROUTE_BASED_PARTIAL_PRICING and not root_full_pricing:
         effective_pricing_workers = 1
     pricing_executor: ProcessPoolExecutor | None = None
     if effective_pricing_workers > 1:
@@ -5598,10 +6247,16 @@ def solve_node_relaxation(
                 force=True,
             )
     elif progress is not None and ROUTE_BASED_PARTIAL_PRICING:
-        progress.emit(
-            f"{node_label}: using sequential partial pricing sweeps across vehicle types",
-            force=True,
-        )
+        if root_full_pricing:
+            progress.emit(
+                f"{node_label}: using sequential full pricing sweeps across vehicle types",
+                force=True,
+            )
+        else:
+            progress.emit(
+                f"{node_label}: using sequential partial pricing sweeps across vehicle types",
+                force=True,
+            )
 
     pricing_batch_size = node_pricing_batch_size(node_label, pricing_columns_per_type)
 
@@ -5636,6 +6291,11 @@ def solve_node_relaxation(
             progress_label=(
                 f"{node_label}: {'raw pricing' if raw_pricing else 'pricing'} "
                 f"{vehicle_type.type_id} in CG iteration {iteration_number}"
+            ),
+            exact_fallback_max_routes=(
+                ROOT_EXACT_PRICING_FALLBACK_MAX_ROUTES
+                if node_label in {"root", "node depth 0"}
+                else EXACT_PRICING_FALLBACK_MAX_ROUTES
             ),
         )
 
@@ -5748,24 +6408,29 @@ def solve_node_relaxation(
             raw_type_duals = {
                 type_id: node_master.type_constraints[type_id].Pi for type_id in vehicle_types
             }
-            current_alpha = adaptive_stabilization_alpha(
-                base_alpha=dual_stabilization_alpha,
-                raw_cover_duals=raw_cover_duals,
-                previous_raw_cover_duals=previous_raw_cover_duals,
-                raw_type_duals=raw_type_duals,
-                previous_raw_type_duals=previous_raw_type_duals,
-                mode=dual_stabilization_mode,
-            )
-            stabilized_cover_duals = stabilize_dual_vector(
-                raw_duals=raw_cover_duals,
-                previous_duals=stabilized_cover_duals,
-                alpha=current_alpha,
-            )
-            stabilized_type_duals = stabilize_dual_vector(
-                raw_duals=raw_type_duals,
-                previous_duals=stabilized_type_duals,
-                alpha=current_alpha,
-            )
+            if root_full_pricing:
+                current_alpha = 1.0
+                stabilized_cover_duals = dict(raw_cover_duals)
+                stabilized_type_duals = dict(raw_type_duals)
+            else:
+                current_alpha = adaptive_stabilization_alpha(
+                    base_alpha=dual_stabilization_alpha,
+                    raw_cover_duals=raw_cover_duals,
+                    previous_raw_cover_duals=previous_raw_cover_duals,
+                    raw_type_duals=raw_type_duals,
+                    previous_raw_type_duals=previous_raw_type_duals,
+                    mode=dual_stabilization_mode,
+                )
+                stabilized_cover_duals = stabilize_dual_vector(
+                    raw_duals=raw_cover_duals,
+                    previous_duals=stabilized_cover_duals,
+                    alpha=current_alpha,
+                )
+                stabilized_type_duals = stabilize_dual_vector(
+                    raw_duals=raw_type_duals,
+                    previous_duals=stabilized_type_duals,
+                    alpha=current_alpha,
+                )
             previous_raw_cover_duals = raw_cover_duals
             previous_raw_type_duals = raw_type_duals
 
@@ -5805,51 +6470,41 @@ def solve_node_relaxation(
             ]
             found_new_route = False
             improving_type_index: int | None = None
-            for ordered_index, vehicle_type in enumerate(type_scan_order):
-                candidate_routes = collect_candidate_routes(
-                    vehicle_types_to_price=[vehicle_type],
-                    cover_duals=stabilized_cover_duals,
-                    type_duals=stabilized_type_duals,
-                    raw_pricing=False,
-                    iteration_number=iteration,
-                )[vehicle_type.type_id]
-                found_raw_improving_route = False
-                for route in candidate_routes:
-                    if (
-                        route_reduced_cost(
-                            route,
-                            cover_duals=raw_cover_duals,
-                            type_dual=raw_type_duals[vehicle_type.type_id],
-                        )
-                        >= -REDUCED_COST_TOL
-                    ):
-                        continue
-                    key = (route.type_id, route.stop_sequence)
-                    if key in route_key_set:
-                        continue
-                    route_key_set.add(key)
-                    route_sequences_by_type[route.type_id].add(route.stop_sequence)
-                    active_route_keys.add(key)
-                    route_pool.append(route)
-                    new_routes.append(route)
-                    add_route_column_to_master(node_master, route)
-                    found_raw_improving_route = True
-
-                if not found_raw_improving_route and current_alpha < 1.0 - 1e-12:
-                    if progress is not None:
-                        progress.emit(
-                            f"{node_label}: CG iteration {iteration}, no raw-improving routes "
-                            f"found for {vehicle_type.type_id} under stabilized pricing; "
-                            "certifying with raw dual pricing"
-                        )
-                    raw_pricing_results = collect_candidate_routes(
-                        vehicle_types_to_price=[vehicle_type],
-                        cover_duals=raw_cover_duals,
-                        type_duals=raw_type_duals,
-                        raw_pricing=True,
+            pricing_round_limit = ROOT_PRICING_EXTRA_SWEEPS if root_full_pricing else 1
+            for pricing_round in range(pricing_round_limit):
+                routes_by_type: dict[str, list[RouteColumn]] | None = None
+                if root_full_pricing:
+                    routes_by_type = collect_candidate_routes(
+                        vehicle_types_to_price=type_scan_order,
+                        cover_duals=stabilized_cover_duals,
+                        type_duals=stabilized_type_duals,
+                        raw_pricing=False,
                         iteration_number=iteration,
-                    )[vehicle_type.type_id]
-                    for route in raw_pricing_results:
+                    )
+                routes_before_round = len(new_routes)
+                for ordered_index, vehicle_type in enumerate(type_scan_order):
+                    routes_before_vehicle = len(new_routes)
+                    if root_full_pricing:
+                        candidate_routes = routes_by_type[vehicle_type.type_id]
+                    else:
+                        candidate_routes = collect_candidate_routes(
+                            vehicle_types_to_price=[vehicle_type],
+                            cover_duals=stabilized_cover_duals,
+                            type_duals=stabilized_type_duals,
+                            raw_pricing=False,
+                            iteration_number=iteration,
+                        )[vehicle_type.type_id]
+                    found_raw_improving_route = False
+                    for route in candidate_routes:
+                        if (
+                            route_reduced_cost(
+                                route,
+                                cover_duals=raw_cover_duals,
+                                type_dual=raw_type_duals[vehicle_type.type_id],
+                            )
+                            >= -REDUCED_COST_TOL
+                        ):
+                            continue
                         key = (route.type_id, route.stop_sequence)
                         if key in route_key_set:
                             continue
@@ -5859,12 +6514,45 @@ def solve_node_relaxation(
                         route_pool.append(route)
                         new_routes.append(route)
                         add_route_column_to_master(node_master, route)
+                        found_raw_improving_route = True
 
-                if new_routes:
-                    found_new_route = True
-                    improving_type_index = (
-                        pricing_start_index + ordered_index
-                    ) % len(vehicle_type_list)
+                    if not found_raw_improving_route and current_alpha < 1.0 - 1e-12:
+                        if progress is not None:
+                            progress.emit(
+                                f"{node_label}: CG iteration {iteration}, no raw-improving routes "
+                                f"found for {vehicle_type.type_id} under stabilized pricing; "
+                                "certifying with raw dual pricing"
+                            )
+                        raw_pricing_results = collect_candidate_routes(
+                            vehicle_types_to_price=[vehicle_type],
+                            cover_duals=raw_cover_duals,
+                            type_duals=raw_type_duals,
+                            raw_pricing=True,
+                            iteration_number=iteration,
+                        )[vehicle_type.type_id]
+                        for route in raw_pricing_results:
+                            key = (route.type_id, route.stop_sequence)
+                            if key in route_key_set:
+                                continue
+                            route_key_set.add(key)
+                            route_sequences_by_type[route.type_id].add(route.stop_sequence)
+                            active_route_keys.add(key)
+                            route_pool.append(route)
+                            new_routes.append(route)
+                            add_route_column_to_master(node_master, route)
+
+                    if len(new_routes) > routes_before_vehicle:
+                        found_new_route = True
+                        improving_type_index = (
+                            pricing_start_index + ordered_index
+                        ) % len(vehicle_type_list)
+                        if not root_full_pricing:
+                            break
+                if not root_full_pricing:
+                    break
+                if len(new_routes) == routes_before_round:
+                    break
+                if len(new_routes) >= ROOT_PRICING_TARGET_NEW_ROUTES_PER_LP:
                     break
 
             if not new_routes:
@@ -6431,6 +7119,34 @@ def branch_and_price(
             note=f"Initial route pool has {len(route_pool)} columns",
         )
         save_checkpoint(f"Initialized branch-and-price with {len(route_pool)} initial columns")
+
+        bootstrap_added_routes = bootstrap_root_route_pool(
+            instance=instance,
+            vehicle_types=vehicle_types,
+            route_pool=route_pool,
+            route_key_set=route_key_set,
+            branch_state=root_state,
+            deadline=deadline,
+            progress=progress,
+        )
+        if bootstrap_added_routes > 0:
+            announce(
+                "Route-based startup root bootstrap added "
+                f"{bootstrap_added_routes} heuristic columns; "
+                f"route pool now has {len(route_pool)} columns"
+            )
+            maybe_record_trace(
+                "bound_update",
+                force=True,
+                note=(
+                    "Root bootstrap added "
+                    f"{bootstrap_added_routes} heuristic columns"
+                ),
+            )
+            save_checkpoint(
+                "Completed root bootstrap with "
+                f"{bootstrap_added_routes} added heuristic columns"
+            )
 
         try:
             initial_heuristic = solve_restricted_integer_master(
