@@ -7,9 +7,11 @@ Fundamental constraints
 5. Under the current Hillcrest-road planning assumption, Stops 18, 19, 20, 21, and 22 must also be served by a Small Van only. Treat them as Hillcrest-access stops until a more precise road-access check is available.
 6. Stop 27 (Redstone Elementary School, 2005 Walnut St) should be treated as an afternoon after-school-program delivery. For now, enforce it as not before 12:00 PM.
 7. Main Street construction assumption: treat every solve as a Monday-through-Thursday construction day rather than a Friday. Add 20 minutes to any travel leg that goes to or from Stops 1, 2, 3, 4, 5, or 6.
+8. Oakwood noise-ordinance assumption: treat Stop 10 (Furniture Warehouse, 1751 Valley Rd) as subject to the residential delivery window and only allow service between 8:00 AM and 7:00 PM.
 
 Open verification item
 
 1. Stop 7 and Stop 8 should only be treated as one shared Redstone Plaza mall-dock delivery if they are confirmed to be the same plaza account. The review notes suggest their addresses may not match that assumption.
 2. Stop 19 is technically on Main Street as well, but the code intentionally ignores that stop for the Main Street construction rule for now.
 3. The Main Street construction rule is currently enforced as always active. If the actual operating day can vary, the model should eventually make Friday or day-of-week behavior explicit instead of relying on this standing assumption.
+4. The Oakwood delivery-window rule is currently enforced by assumption for Stop 10. If Stop 10 is later confirmed to be outside the Oakwood residential zone, this extra time window should be removed.

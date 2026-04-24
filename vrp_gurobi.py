@@ -56,7 +56,7 @@ EXACT_PRICING_NATIVE_MIN_BUCKET_SIZE = 2
 EXACT_PRICING_NUMPY_MIN_BUCKET_SIZE = 16
 # Bump whenever the default arc-flow MIP variable set or feasibility logic changes
 # in a way that can invalidate persisted .mst/.sol starts.
-DEFAULT_MIP_FORMULATION_VERSION = 5
+DEFAULT_MIP_FORMULATION_VERSION = 6
 DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
 DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT = 1.0
 _NATIVE_PRICING_LIBRARY: Any | None | bool = None
@@ -290,6 +290,15 @@ HARD_STOP_SERVICE_WINDOW_RULES: tuple[StopServiceWindowRule, ...] = (
         earliest_min=12.0 * 60.0,
         latest_min=None,
         description="Redstone Medical Center (Stop 3) may not be served before 12:00 PM.",
+    ),
+    StopServiceWindowRule(
+        stop_id=10,
+        earliest_min=8.0 * 60.0,
+        latest_min=19.0 * 60.0,
+        description=(
+            "Oakwood noise-ordinance assumption: Stop 10 (Furniture Warehouse, 1751 Valley Rd) "
+            "may only be served between 8:00 AM and 7:00 PM."
+        ),
     ),
     StopServiceWindowRule(
         stop_id=14,
