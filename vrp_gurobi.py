@@ -2116,6 +2116,196 @@ def run_pricing_worker(
     )
 
 
+def heuristic_pricing_seed_routes(
+    instance: Instance,
+    vehicle_type: VehicleTypeData,
+    cover_duals: dict[int, float],
+    type_dual: float,
+    branch_ctx: BranchContext,
+    excluded_stop_sequences: set[tuple[int, ...]] | None,
+) -> list[RouteColumn]:
+    excluded_stop_sequences = excluded_stop_sequences or set()
+    seeds: list[tuple[float, RouteColumn]] = []
+    seen_sequences: set[tuple[int, ...]] = set()
+
+    def maybe_add_seed(route: RouteColumn | None) -> None:
+        if route is None:
+            return
+        if route.stop_sequence in excluded_stop_sequences:
+            return
+        if route.stop_sequence in seen_sequences:
+            return
+        if not route_is_compatible(route, branch_ctx):
+            return
+        seen_sequences.add(route.stop_sequence)
+        seeds.append(
+            (
+                route_reduced_cost(
+                    route,
+                    cover_duals=cover_duals,
+                    type_dual=type_dual,
+                ),
+                route,
+            )
+        )
+
+    for candidate_type_name, route_sequences in CONSTRUCTIVE_ARC_FLOW_SEED_BY_VEHICLE_TYPE.items():
+        if candidate_type_name != vehicle_type.vehicle_type:
+            continue
+        for stop_sequence in route_sequences:
+            maybe_add_seed(evaluate_route_sequence(instance, vehicle_type, stop_sequence))
+
+    for rule in REDSTONE_PLAZA_PAIR_RULES:
+        for stop_sequence in ((rule.stop_a, rule.stop_b), (rule.stop_b, rule.stop_a)):
+            maybe_add_seed(evaluate_route_sequence(instance, vehicle_type, stop_sequence))
+
+    singleton_routes: list[tuple[float, RouteColumn]] = []
+    for stop_id in sorted(
+        instance.stops,
+        key=lambda candidate_stop_id: (
+            -cover_duals[candidate_stop_id],
+            instance.stops[candidate_stop_id].latest_min,
+            -instance.stops[candidate_stop_id].demand_kg,
+            candidate_stop_id,
+        ),
+    ):
+        route = evaluate_route_sequence(instance, vehicle_type, (stop_id,))
+        if route is None or not route_is_compatible(route, branch_ctx):
+            continue
+        singleton_routes.append(
+            (
+                route_reduced_cost(
+                    route,
+                    cover_duals=cover_duals,
+                    type_dual=type_dual,
+                ),
+                route,
+            )
+        )
+    singleton_routes.sort(
+        key=lambda item: (
+            item[0],
+            item[1].cost,
+            len(item[1].stop_sequence),
+            item[1].stop_sequence,
+        )
+    )
+    for _, route in singleton_routes[:12]:
+        maybe_add_seed(route)
+
+    seeds.sort(
+        key=lambda item: (
+            item[0],
+            item[1].cost,
+            len(item[1].stop_sequence),
+            item[1].stop_sequence,
+        )
+    )
+    return [route for _, route in seeds]
+
+
+def solve_heuristic_pricing_subproblem(
+    instance: Instance,
+    vehicle_type: VehicleTypeData,
+    cover_duals: dict[int, float],
+    type_dual: float,
+    branch_ctx: BranchContext,
+    max_routes: int,
+    excluded_stop_sequences: set[tuple[int, ...]] | None,
+) -> list[RouteColumn]:
+    if max_routes <= 0:
+        return []
+
+    excluded_stop_sequences = excluded_stop_sequences or set()
+    candidate_stops = sorted(
+        instance.stops,
+        key=lambda stop_id: (
+            -cover_duals[stop_id],
+            instance.stops[stop_id].latest_min,
+            -instance.stops[stop_id].demand_kg,
+            stop_id,
+        ),
+    )
+    seed_routes = heuristic_pricing_seed_routes(
+        instance=instance,
+        vehicle_type=vehicle_type,
+        cover_duals=cover_duals,
+        type_dual=type_dual,
+        branch_ctx=branch_ctx,
+        excluded_stop_sequences=excluded_stop_sequences,
+    )
+    if not seed_routes:
+        return []
+
+    improving_routes: list[tuple[float, RouteColumn]] = []
+    seen_sequences: set[tuple[int, ...]] = set(excluded_stop_sequences)
+
+    for seed_route in seed_routes:
+        current_route = seed_route
+        current_rc = route_reduced_cost(
+            current_route,
+            cover_duals=cover_duals,
+            type_dual=type_dual,
+        )
+
+        improved = True
+        while improved:
+            improved = False
+            best_next_route: RouteColumn | None = None
+            best_next_rc = current_rc
+            current_sequence = current_route.stop_sequence
+
+            for stop_id in candidate_stops:
+                if stop_id in current_route.stop_set:
+                    continue
+                for pos in range(len(current_sequence) + 1):
+                    candidate_sequence = (
+                        current_sequence[:pos] + (stop_id,) + current_sequence[pos:]
+                    )
+                    if candidate_sequence in seen_sequences:
+                        continue
+                    candidate_route = evaluate_route_sequence(
+                        instance,
+                        vehicle_type,
+                        candidate_sequence,
+                    )
+                    if candidate_route is None:
+                        continue
+                    if not route_is_compatible(candidate_route, branch_ctx):
+                        continue
+                    candidate_rc = route_reduced_cost(
+                        candidate_route,
+                        cover_duals=cover_duals,
+                        type_dual=type_dual,
+                    )
+                    if candidate_rc < best_next_rc - REDUCED_COST_TOL:
+                        best_next_route = candidate_route
+                        best_next_rc = candidate_rc
+
+            if best_next_route is not None:
+                current_route = best_next_route
+                current_rc = best_next_rc
+                improved = True
+
+        if current_route.stop_sequence in seen_sequences:
+            continue
+        seen_sequences.add(current_route.stop_sequence)
+        if current_rc < -REDUCED_COST_TOL:
+            improving_routes.append((current_rc, current_route))
+            if len(improving_routes) >= max_routes:
+                break
+
+    improving_routes.sort(
+        key=lambda item: (
+            item[0],
+            item[1].cost,
+            len(item[1].stop_sequence),
+            item[1].stop_sequence,
+        )
+    )
+    return [route for _, route in improving_routes[:max_routes]]
+
+
 def load_instance(workbook_path: Path) -> Instance:
     wb = load_workbook(workbook_path, data_only=True)
 
@@ -4004,6 +4194,53 @@ def construct_seed_partition_routes(
     return []
 
 
+def construct_known_feasible_seed_routes(
+    instance: Instance,
+    vehicle_types: dict[str, VehicleTypeData],
+) -> list[RouteColumn]:
+    vehicle_types_by_name: dict[str, list[VehicleTypeData]] = defaultdict(list)
+    for vehicle_type in vehicle_types.values():
+        vehicle_types_by_name[vehicle_type.vehicle_type].append(vehicle_type)
+    for candidate_types in vehicle_types_by_name.values():
+        candidate_types.sort(key=lambda candidate: min(candidate.vehicle_ids))
+
+    remaining_by_type: dict[str, int] = {
+        type_id: vehicle_type.count for type_id, vehicle_type in vehicle_types.items()
+    }
+    seed_routes: list[RouteColumn] = []
+    covered_stops: list[int] = []
+
+    for vehicle_type_name, route_sequences in CONSTRUCTIVE_ARC_FLOW_SEED_BY_VEHICLE_TYPE.items():
+        candidate_types = vehicle_types_by_name.get(vehicle_type_name, [])
+        if not candidate_types:
+            return []
+        for stop_sequence in route_sequences:
+            chosen_route: RouteColumn | None = None
+            chosen_vehicle_type: VehicleTypeData | None = None
+            for candidate_type in candidate_types:
+                if remaining_by_type[candidate_type.type_id] <= 0:
+                    continue
+                route = evaluate_route_sequence(instance, candidate_type, stop_sequence)
+                if route is None:
+                    continue
+                if sum(route.late_min.values()) > 1e-6:
+                    continue
+                chosen_route = route
+                chosen_vehicle_type = candidate_type
+                break
+            if chosen_route is None or chosen_vehicle_type is None:
+                return []
+            remaining_by_type[chosen_vehicle_type.type_id] -= 1
+            seed_routes.append(chosen_route)
+            covered_stops.extend(stop_sequence)
+
+    if len(covered_stops) != len(instance.stops):
+        return []
+    if set(covered_stops) != set(instance.stops):
+        return []
+    return seed_routes
+
+
 def initial_routes(
     instance: Instance,
     vehicle_types: dict[str, VehicleTypeData],
@@ -4021,6 +4258,11 @@ def initial_routes(
                 routes.append(route)
 
     route_keys = {(route.type_id, route.stop_sequence) for route in routes}
+    for route in construct_known_feasible_seed_routes(instance, vehicle_types):
+        key = (route.type_id, route.stop_sequence)
+        if key not in route_keys:
+            route_keys.add(key)
+            routes.append(route)
     for route in construct_seed_partition_routes(instance, vehicle_types):
         key = (route.type_id, route.stop_sequence)
         if key not in route_keys:
@@ -4214,6 +4456,22 @@ def solve_pricing_subproblem(
 ) -> list[RouteColumn]:
     if max_routes <= 0:
         return []
+    heuristic_routes = solve_heuristic_pricing_subproblem(
+        instance=instance,
+        vehicle_type=vehicle_type,
+        cover_duals=cover_duals,
+        type_dual=type_dual,
+        branch_ctx=branch_ctx,
+        max_routes=max_routes,
+        excluded_stop_sequences=excluded_stop_sequences,
+    )
+    if heuristic_routes:
+        if progress is not None:
+            progress.emit(
+                f"{progress_label or f'pricing {vehicle_type.type_id}'}: heuristic pricing "
+                f"found {len(heuristic_routes)} improving route(s); skipping exact labeling"
+            )
+        return heuristic_routes
     stop_ids = sorted(instance.stops)
     start_limit = vehicle_start_limit(instance, vehicle_type)
     end_limit = vehicle_end_limit(instance, vehicle_type)
@@ -5684,6 +5942,7 @@ def branch_and_price(
     validate_shared_cost_assumptions(instance)
     vehicle_types = build_vehicle_types(instance)
     deadline = perf_counter() + time_limit if time_limit is not None else None
+    known_seed_routes = construct_known_feasible_seed_routes(instance, vehicle_types)
     checkpoint_state = (
         load_branch_and_price_checkpoint(
             resume_from,
@@ -5740,6 +5999,11 @@ def branch_and_price(
         current_node = checkpoint_state.current_node
     route_key_set = {(route.type_id, route.stop_sequence) for route in route_pool}
     status = "UNKNOWN"
+
+    def announce(message: str) -> None:
+        print(message, flush=True)
+        if progress is not None:
+            progress.emit(message, force=True)
 
     def pending_node_count() -> int:
         return len(active_nodes) + (1 if current_node is not None else 0)
@@ -5841,11 +6105,11 @@ def branch_and_price(
         last_logged_bound = best_bound
 
     if checkpoint_state is None:
-        if progress is not None:
-            progress.emit(
-                f"Starting branch-and-price with {len(route_pool)} initial columns",
-                force=True,
-            )
+        announce(
+            "Route-based startup: "
+            f"{len(route_pool)} initial columns "
+            f"({len(known_seed_routes)} known constructive seed routes)"
+        )
         maybe_record_trace(
             "run_start",
             force=True,
@@ -5867,11 +6131,10 @@ def branch_and_price(
             initial_heuristic = None
         if initial_heuristic is not None:
             incumbent_obj, incumbent_routes = initial_heuristic
-            if progress is not None:
-                progress.emit(
-                    f"Initial restricted-master incumbent: {incumbent_obj:.2f}",
-                    force=True,
-                )
+            announce(
+                "Route-based startup incumbent from seeded restricted master: "
+                f"{incumbent_obj:.2f}"
+            )
             maybe_record_trace(
                 "incumbent_update",
                 force=True,
@@ -5879,13 +6142,13 @@ def branch_and_price(
             )
             maybe_save_incumbent_report(force=True)
             save_checkpoint("Captured initial restricted-master incumbent")
+        else:
+            announce("Route-based startup did not find an initial restricted-master incumbent.")
     else:
-        if progress is not None:
-            progress.emit(
-                f"Resuming branch-and-price from {resume_from} with {len(route_pool)} "
-                f"global columns and {pending_node_count()} pending nodes",
-                force=True,
-            )
+        announce(
+            f"Resuming branch-and-price from {resume_from} with {len(route_pool)} "
+            f"global columns and {pending_node_count()} pending nodes"
+        )
         maybe_record_trace(
             "run_resume",
             force=True,
