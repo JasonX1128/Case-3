@@ -4,7 +4,8 @@ Fundamental constraints
 2. Stop 14 (Sunrise Senior Living) cannot be served before 10:00 AM.
 3. Any driver whose route overlaps midday must take one 30-minute lunch break between 11:30 AM and 1:30 PM.
 4. Stop 5 (Construction Supply, 8617 Fourth St) must be served by a Small Van only. The Hillcrest Road area has a five-ton county road restriction, so Large Truck assignments are not allowed for this stop. It is likely that medium trucks are also not allowed but should be verified before being ruled out.
-5. Stop 27 (Redstone Elementary School, 2005 Walnut St) should be treated as an afternoon after-school-program delivery. For now, enforce it as not before 12:00 PM.
+5. Under the current Hillcrest-road planning assumption, Stops 18, 19, 20, 21, and 22 must also be served by a Small Van only. Treat them as Hillcrest-access stops until a more precise road-access check is available.
+6. Stop 27 (Redstone Elementary School, 2005 Walnut St) should be treated as an afternoon after-school-program delivery. For now, enforce it as not before 12:00 PM.
 
 Open verification item
 

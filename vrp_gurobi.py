@@ -85,6 +85,9 @@ class StopAllowedVehicleTypesRule:
     description: str
 
 
+HILLCREST_SMALL_VAN_ONLY_STOPS: tuple[int, ...] = (18, 19, 20, 21, 22)
+
+
 REDSTONE_PLAZA_PAIR_RULES: tuple[RequiredAdjacentStopPairRule, ...] = (
     RequiredAdjacentStopPairRule(
         stop_a=7,
@@ -128,6 +131,17 @@ STOP_ALLOWED_VEHICLE_TYPE_RULES: tuple[StopAllowedVehicleTypesRule, ...] = (
             "Construction Supply (Stop 5, 8617 Fourth St) sits in the Hillcrest Road "
             "restricted area and may only be served by a Small Van."
         ),
+    ),
+    *(
+        StopAllowedVehicleTypesRule(
+            stop_id=stop_id,
+            allowed_vehicle_types=frozenset({"Small Van"}),
+            description=(
+                "Hillcrest Road restriction assumption: Stops 18-22 are treated as "
+                "Hillcrest-access stops and may only be served by a Small Van."
+            ),
+        )
+        for stop_id in HILLCREST_SMALL_VAN_ONLY_STOPS
     ),
 )
 STOP_ALLOWED_VEHICLE_TYPE_RULE_BY_STOP = {
@@ -2283,11 +2297,23 @@ def incremental_labor_cost(
 
 
 def active_business_rule_descriptions() -> list[str]:
-    descriptions = [rule.description for rule in HARD_STOP_SERVICE_WINDOW_RULES]
-    descriptions.extend(rule.description for rule in REDSTONE_PLAZA_PAIR_RULES)
-    descriptions.extend(rule.description for rule in STOP_ALLOWED_VEHICLE_TYPE_RULES)
+    descriptions: list[str] = []
+    seen: set[str] = set()
+
+    def add(description: str) -> None:
+        if description in seen:
+            return
+        seen.add(description)
+        descriptions.append(description)
+
+    for rule in HARD_STOP_SERVICE_WINDOW_RULES:
+        add(rule.description)
+    for rule in REDSTONE_PLAZA_PAIR_RULES:
+        add(rule.description)
+    for rule in STOP_ALLOWED_VEHICLE_TYPE_RULES:
+        add(rule.description)
     if MIDDAY_LUNCH_BREAK_RULE is not None:
-        descriptions.append(MIDDAY_LUNCH_BREAK_RULE.description)
+        add(MIDDAY_LUNCH_BREAK_RULE.description)
     return descriptions
 
 
