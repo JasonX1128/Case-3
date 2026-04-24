@@ -4,3 +4,6 @@ __pycache__/
 *.csv
 plots
 .mip_persist/
+*_incumbent_report.txt
+*_trivial_seed_report.txt
+grbnodes*/
