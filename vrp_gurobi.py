@@ -7,6 +7,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import re
 import shutil
 import signal
 from collections import defaultdict
@@ -1042,6 +1043,145 @@ class IncumbentReportWriter:
         return saved_path
 
 
+class ArcFlowProgressLogger:
+    FIELDNAMES = (
+        "timestamp",
+        "elapsed_seconds",
+        "marker",
+        "explored_nodes",
+        "unexplored_nodes",
+        "current_node_obj",
+        "current_node_depth",
+        "current_node_intinf",
+        "incumbent_objective",
+        "best_bound",
+        "gap_percent",
+        "simplex_iterations_per_node",
+        "display_time_seconds",
+        "raw_line",
+    )
+
+    _FULL_LINE_RE = re.compile(
+        r"^\s*(?P<marker>[H\*]?)\s*"
+        r"(?P<explored>\d+)\s+"
+        r"(?P<unexplored>\d+)\s+"
+        r"(?P<node_obj>(?:[+\-]?\d+(?:\.\d+)?|cutoff|infeasible))\s+"
+        r"(?P<depth>\d+)\s+"
+        r"(?P<intinf>\d+)\s+"
+        r"(?P<incumbent>(?:[+\-]?\d+(?:\.\d+)?|-))\s+"
+        r"(?P<bestbd>[+\-]?\d+(?:\.\d+)?)\s+"
+        r"(?P<gap>(?:[+\-]?\d+(?:\.\d+)?|-))%?\s+"
+        r"(?P<itnode>(?:[+\-]?\d+(?:\.\d+)?|-))\s+"
+        r"(?P<time>\d+)s\s*$"
+    )
+    _INCUMBENT_LINE_RE = re.compile(
+        r"^\s*(?P<marker>[H\*])\s*"
+        r"(?P<explored>\d+)\s+"
+        r"(?P<unexplored>\d+)\s+"
+        r"(?P<incumbent>[+\-]?\d+(?:\.\d+)?)\s+"
+        r"(?P<bestbd>[+\-]?\d+(?:\.\d+)?)\s+"
+        r"(?P<gap>[+\-]?\d+(?:\.\d+)?)%\s+"
+        r"(?P<itnode>(?:[+\-]?\d+(?:\.\d+)?|-))\s+"
+        r"(?P<time>\d+)s\s*$"
+    )
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = None if path is None else path.resolve()
+        self._file = None
+        self._writer: csv.DictWriter[str] | None = None
+
+        if self.path is None:
+            return
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("w", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDNAMES)
+        self._writer.writeheader()
+        self._flush()
+
+    def _flush(self) -> None:
+        if self._file is None:
+            return
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    @staticmethod
+    def _parse_optional_float(token: str) -> float | None:
+        if token in {"-", "cutoff", "infeasible"}:
+            return None
+        return float(token)
+
+    @staticmethod
+    def _parse_optional_int(token: str) -> int | None:
+        if token in {"cutoff", "infeasible"}:
+            return None
+        return int(token)
+
+    def record_message(self, line: str) -> bool:
+        if self._writer is None:
+            return False
+        stripped_line = line.rstrip("\n")
+        match = self._FULL_LINE_RE.match(stripped_line)
+        row: dict[str, object]
+        if match is not None:
+            current_node_obj = self._parse_optional_float(match.group("node_obj"))
+            incumbent_objective = self._parse_optional_float(match.group("incumbent"))
+            gap_percent = self._parse_optional_float(match.group("gap"))
+            simplex_iterations_per_node = self._parse_optional_float(match.group("itnode"))
+            row = {
+                "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "elapsed_seconds": match.group("time"),
+                "marker": match.group("marker") or "",
+                "explored_nodes": int(match.group("explored")),
+                "unexplored_nodes": int(match.group("unexplored")),
+                "current_node_obj": "" if current_node_obj is None else current_node_obj,
+                "current_node_depth": int(match.group("depth")),
+                "current_node_intinf": int(match.group("intinf")),
+                "incumbent_objective": "" if incumbent_objective is None else incumbent_objective,
+                "best_bound": float(match.group("bestbd")),
+                "gap_percent": "" if gap_percent is None else gap_percent,
+                "simplex_iterations_per_node": (
+                    "" if simplex_iterations_per_node is None else simplex_iterations_per_node
+                ),
+                "display_time_seconds": int(match.group("time")),
+                "raw_line": stripped_line,
+            }
+        else:
+            match = self._INCUMBENT_LINE_RE.match(stripped_line)
+            if match is None:
+                return False
+            simplex_iterations_per_node = self._parse_optional_float(match.group("itnode"))
+            row = {
+                "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "elapsed_seconds": match.group("time"),
+                "marker": match.group("marker") or "",
+                "explored_nodes": int(match.group("explored")),
+                "unexplored_nodes": int(match.group("unexplored")),
+                "current_node_obj": "",
+                "current_node_depth": "",
+                "current_node_intinf": "",
+                "incumbent_objective": float(match.group("incumbent")),
+                "best_bound": float(match.group("bestbd")),
+                "gap_percent": float(match.group("gap")),
+                "simplex_iterations_per_node": (
+                    "" if simplex_iterations_per_node is None else simplex_iterations_per_node
+                ),
+                "display_time_seconds": int(match.group("time")),
+                "raw_line": stripped_line,
+            }
+        self._writer.writerow(row)
+        self._flush()
+        return True
+
+    def close(self) -> None:
+        if self._file is None:
+            return
+        self._flush()
+        self._file.close()
+        self._file = None
+        self._writer = None
+
+
 def candidate_dotenv_paths() -> list[Path]:
     paths = [Path(__file__).resolve().with_name(".env"), Path.cwd() / ".env"]
     unique_paths: list[Path] = []
@@ -1512,11 +1652,13 @@ def optimize_with_heartbeat(
     label: str,
     bound_logger: MIPBoundLogger | None = None,
     mip_solution_callback: Callable[[gp.Model], None] | None = None,
+    message_callback: Callable[[str], None] | None = None,
 ) -> None:
     if (
         (progress is None or not progress.enabled)
         and bound_logger is None
         and mip_solution_callback is None
+        and message_callback is None
     ):
         model.optimize()
         return
@@ -1534,6 +1676,13 @@ def optimize_with_heartbeat(
     last_runtime_report = [-heartbeat_interval]
 
     def callback(cb_model: gp.Model, where: int) -> None:
+        if where == GRB.Callback.MESSAGE and message_callback is not None:
+            try:
+                message = str(cb_model.cbGet(GRB.Callback.MSG_STRING))
+            except gp.GurobiError:
+                message = ""
+            if message:
+                message_callback(message)
         if bound_logger is not None:
             bound_logger.record_callback(cb_model, where)
         if where == GRB.Callback.MIPSOL and mip_solution_callback is not None:
@@ -1608,6 +1757,10 @@ def optional_float_changed(previous: float | None, current: float | None, tol: f
 def default_objective_trace_path(workbook_path: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return workbook_path.with_name(f"{workbook_path.stem}_objective_trace_{timestamp}.csv")
+
+
+def default_arc_flow_progress_log_path(workbook_path: Path, run_timestamp: str) -> Path:
+    return workbook_path.parent / f"{workbook_path.stem}_arc_flow_progress_{run_timestamp}.csv"
 
 
 def default_mip_bound_plot_path(workbook_path: Path, run_timestamp: str) -> Path:
@@ -3288,6 +3441,8 @@ def solve_arc_flow_model(
     incumbent_report_writer: IncumbentReportWriter | None = None,
 ) -> ArcFlowSolveResult:
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    progress_log_path = default_arc_flow_progress_log_path(workbook_path, run_timestamp)
+    progress_logger = ArcFlowProgressLogger(progress_log_path)
     bound_plot_path = default_mip_bound_plot_path(workbook_path, run_timestamp)
     bound_logger = MIPBoundLogger(bound_plot_path)
     saved_bound_plot_path: Path | None = None
@@ -3295,6 +3450,9 @@ def solve_arc_flow_model(
     model: gp.Model | None = None
 
     try:
+        if progress_logger.path is not None:
+            record_interrupt_artifact("arc_flow_progress_log", progress_logger.path)
+            print(f"Arc-flow progress log: {progress_logger.path}")
         instance = load_instance(workbook_path)
         print_stop_reference(instance)
         model, data = build_arc_flow_model(instance)
@@ -3378,6 +3536,7 @@ def solve_arc_flow_model(
                 label="arc-flow master MIP",
                 bound_logger=bound_logger,
                 mip_solution_callback=maybe_save_mip_incumbent_report,
+                message_callback=progress_logger.record_message,
             )
             capture_mip_bound_snapshot(model, bound_logger)
         except KeyboardInterrupt:
@@ -3554,6 +3713,8 @@ def solve_arc_flow_model(
                 record_interrupt_artifact("partial_mip_bound_plot", saved_bound_plot_path)
                 print(f"\nPartial MIP bound plot saved to {saved_bound_plot_path}")
         raise
+    finally:
+        progress_logger.close()
 
 
 def best_stop_insertion(
