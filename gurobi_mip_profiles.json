@@ -7,7 +7,7 @@
       "Cuts": 1,
       "Symmetry": 2,
       "Presolve": 2,
-      "Threads": 4,
+      "Threads": -1,
       "NodefileStart": 0.5
     }
   },
@@ -29,13 +29,26 @@
     "description": "Long-run proof-quality profile for the default arc-flow MIP. Use this when you care more about bound movement and eventual optimality than about a quick incumbent.",
     "params": {
       "MIPFocus": 3,
-      "Heuristics": 0.05,
-      "Cuts": 2,
+      "Heuristics": 0.00,
+      "Cuts": 3,
       "Symmetry": 2,
       "Presolve": 2,
       "IntegralityFocus": 1,
-      "Threads": 4,
+      "Threads": -1,
       "NodefileStart": 0.5
     }
-  }
+  },
+  "find-incumbent": {
+	"description": "Incumbent-hunting profile",
+	"params": {
+	  "MIPFocus": 1,
+      "Heuristics": 0.35,
+	  "IntegralityFocus": 1,
+      "Cuts": 1,
+      "Symmetry": 2,
+      "Presolve": 2,
+      "Threads": -1,
+      "NodefileStart": 0.5
+	}
+   }
 }
