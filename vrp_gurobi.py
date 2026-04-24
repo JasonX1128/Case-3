@@ -3912,6 +3912,31 @@ def solve_arc_flow_model(
                         "Applied built-in constructive MIP start with elevated start repair effort.",
                         flush=True,
                     )
+        else:
+            # Keep the persisted resume as start 0 and append the built-in constructive
+            # seed as start 1 so Gurobi can fall back immediately if the resume start is
+            # stale, partial, or otherwise fails to yield an incumbent.
+            model.NumStart = max(int(model.NumStart), 2)
+            applied_constructive_seed = apply_constructive_arc_flow_mip_start(
+                instance,
+                data,
+                model=model,
+                start_number=1,
+            )
+            if applied_constructive_seed:
+                model.Params.StartNodeLimit = max(int(getattr(model.Params, "StartNodeLimit", 0)), 5000)
+                model.update()
+                print(
+                    "Loaded saved MIP start from persistence and added the built-in "
+                    "constructive fallback start.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "Loaded saved MIP start from persistence; built-in constructive "
+                    "fallback start could not be built.",
+                    flush=True,
+                )
         mip_start_vars = [
             (var.VarName, var, var.VType)
             for var in model.getVars()
