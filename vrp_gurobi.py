@@ -31,6 +31,12 @@ ARTIFICIAL_COVER_PENALTY = 1_000_000.0
 INITIAL_ACTIVE_COVER_CANDIDATES_PER_STOP = 3
 INITIAL_ACTIVE_CHEAPEST_ROUTES_PER_TYPE = 12
 INITIAL_ACTIVE_RECENT_ROUTES_PER_TYPE = 12
+ROOT_PRICING_COLUMNS_MIN = 30
+ROOT_PRICING_COLUMNS_MULTIPLIER = 10
+EXACT_PRICING_FALLBACK_MAX_ROUTES = 1
+HEURISTIC_PRICING_SINGLETON_SEED_LIMIT = 40
+HEURISTIC_PRICING_BEAM_WIDTH = 8
+ROUTE_BASED_PARTIAL_PRICING = True
 # Bump whenever the default arc-flow MIP variable set or feasibility logic changes
 # in a way that can invalidate persisted .mst/.sol starts.
 DEFAULT_MIP_FORMULATION_VERSION = 4
@@ -488,7 +494,7 @@ class BranchAndPriceCheckpointState:
     status: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PricingLabel:
     node: int
     visited_mask: int
@@ -498,6 +504,17 @@ class PricingLabel:
     reduced_cost: float
     nonlabor_reduced_cost: float
     predecessor_idx: int | None
+
+
+@dataclass(slots=True)
+class PricingLabelBucket:
+    label_indices: list[int]
+    min_time_after_service: float
+    min_load_kg: float
+    min_nonlabor_reduced_cost: float
+    max_time_after_service: float
+    max_load_kg: float
+    max_nonlabor_reduced_cost: float
 
 
 class ProgressTracker:
@@ -2192,7 +2209,7 @@ def heuristic_pricing_seed_routes(
             item[1].stop_sequence,
         )
     )
-    for _, route in singleton_routes[:12]:
+    for _, route in singleton_routes[:HEURISTIC_PRICING_SINGLETON_SEED_LIMIT]:
         maybe_add_seed(route)
 
     seeds.sort(
@@ -2243,59 +2260,86 @@ def solve_heuristic_pricing_subproblem(
     seen_sequences: set[tuple[int, ...]] = set(excluded_stop_sequences)
 
     for seed_route in seed_routes:
-        current_route = seed_route
-        current_rc = route_reduced_cost(
-            current_route,
-            cover_duals=cover_duals,
-            type_dual=type_dual,
-        )
+        frontier: list[tuple[float, RouteColumn]] = [
+            (
+                route_reduced_cost(
+                    seed_route,
+                    cover_duals=cover_duals,
+                    type_dual=type_dual,
+                ),
+                seed_route,
+            )
+        ]
 
-        improved = True
-        while improved:
-            improved = False
-            best_next_route: RouteColumn | None = None
-            best_next_rc = current_rc
-            current_sequence = current_route.stop_sequence
+        while frontier:
+            next_frontier: list[tuple[float, RouteColumn]] = []
+            for current_rc, current_route in frontier:
+                current_sequence = current_route.stop_sequence
+                if current_sequence not in seen_sequences and current_rc < -REDUCED_COST_TOL:
+                    seen_sequences.add(current_sequence)
+                    improving_routes.append((current_rc, current_route))
+                    if len(improving_routes) >= max_routes:
+                        break
 
-            for stop_id in candidate_stops:
-                if stop_id in current_route.stop_set:
-                    continue
-                for pos in range(len(current_sequence) + 1):
-                    candidate_sequence = (
-                        current_sequence[:pos] + (stop_id,) + current_sequence[pos:]
-                    )
-                    if candidate_sequence in seen_sequences:
+                extension_candidates: list[tuple[float, RouteColumn]] = []
+                for stop_id in candidate_stops:
+                    if stop_id in current_route.stop_set:
                         continue
-                    candidate_route = evaluate_route_sequence(
-                        instance,
-                        vehicle_type,
-                        candidate_sequence,
-                    )
-                    if candidate_route is None:
-                        continue
-                    if not route_is_compatible(candidate_route, branch_ctx):
-                        continue
-                    candidate_rc = route_reduced_cost(
-                        candidate_route,
-                        cover_duals=cover_duals,
-                        type_dual=type_dual,
-                    )
-                    if candidate_rc < best_next_rc - REDUCED_COST_TOL:
-                        best_next_route = candidate_route
-                        best_next_rc = candidate_rc
+                    for pos in range(len(current_sequence) + 1):
+                        candidate_sequence = (
+                            current_sequence[:pos] + (stop_id,) + current_sequence[pos:]
+                        )
+                        if candidate_sequence in seen_sequences:
+                            continue
+                        candidate_route = evaluate_route_sequence(
+                            instance,
+                            vehicle_type,
+                            candidate_sequence,
+                        )
+                        if candidate_route is None:
+                            continue
+                        if not route_is_compatible(candidate_route, branch_ctx):
+                            continue
+                        candidate_rc = route_reduced_cost(
+                            candidate_route,
+                            cover_duals=cover_duals,
+                            type_dual=type_dual,
+                        )
+                        if candidate_rc < current_rc - REDUCED_COST_TOL:
+                            extension_candidates.append((candidate_rc, candidate_route))
 
-            if best_next_route is not None:
-                current_route = best_next_route
-                current_rc = best_next_rc
-                improved = True
+                extension_candidates.sort(
+                    key=lambda item: (
+                        item[0],
+                        item[1].cost,
+                        len(item[1].stop_sequence),
+                        item[1].stop_sequence,
+                    )
+                )
+                next_frontier.extend(extension_candidates[:HEURISTIC_PRICING_BEAM_WIDTH])
 
-        if current_route.stop_sequence in seen_sequences:
-            continue
-        seen_sequences.add(current_route.stop_sequence)
-        if current_rc < -REDUCED_COST_TOL:
-            improving_routes.append((current_rc, current_route))
             if len(improving_routes) >= max_routes:
                 break
+            if not next_frontier:
+                break
+
+            frontier = []
+            frontier_seen: set[tuple[int, ...]] = set()
+            for candidate_rc, candidate_route in sorted(
+                next_frontier,
+                key=lambda item: (
+                    item[0],
+                    item[1].cost,
+                    len(item[1].stop_sequence),
+                    item[1].stop_sequence,
+                ),
+            ):
+                if candidate_route.stop_sequence in frontier_seen:
+                    continue
+                frontier_seen.add(candidate_route.stop_sequence)
+                frontier.append((candidate_rc, candidate_route))
+                if len(frontier) >= HEURISTIC_PRICING_BEAM_WIDTH:
+                    break
 
     improving_routes.sort(
         key=lambda item: (
@@ -4583,6 +4627,14 @@ def solve_pricing_subproblem(
                 f"found {len(heuristic_routes)} improving route(s); skipping exact labeling"
             )
         return heuristic_routes
+    exact_max_routes = min(max_routes, EXACT_PRICING_FALLBACK_MAX_ROUTES)
+    if progress is not None and exact_max_routes < max_routes:
+        progress.emit(
+            f"{progress_label or f'pricing {vehicle_type.type_id}'}: heuristic pricing found "
+            "no improving routes; exact fallback will search for the first certified "
+            "improving route"
+        )
+    max_routes = exact_max_routes
     stop_ids = sorted(instance.stops)
     start_limit = vehicle_start_limit(instance, vehicle_type)
     end_limit = vehicle_end_limit(instance, vehicle_type)
@@ -4739,7 +4791,9 @@ def solve_pricing_subproblem(
 
     label_store: list[PricingLabel] = []
     label_alive: list[bool] = []
-    labels_at_node: dict[int, list[int]] = defaultdict(list)
+    labels_by_state: dict[
+        tuple[int, bool, int, int], dict[int, PricingLabelBucket]
+    ] = defaultdict(dict)
     frontier: list[tuple[float, float, int]] = []
     explored_labels = 0
 
@@ -4763,14 +4817,13 @@ def solve_pricing_subproblem(
         _, break_end = lunch_window
         return (break_end - label.time_after_service) + travel_to_depot
 
-    def dominates(lhs: PricingLabel, rhs: PricingLabel) -> bool:
+    def label_state_key(label: PricingLabel) -> tuple[int, bool, int, int]:
+        pending_partner = pending_required_adjacent_partner(label)
         return (
-            lhs.node == rhs.node
-            and lhs.lunch_break_taken == rhs.lunch_break_taken
-            and lhs.time_after_service <= rhs.time_after_service + 1e-9
-            and lhs.load_kg <= rhs.load_kg + 1e-9
-            and lhs.nonlabor_reduced_cost <= rhs.nonlabor_reduced_cost + 1e-9
-            and (lhs.visited_mask & ~rhs.visited_mask) == 0
+            label.node,
+            label.lunch_break_taken,
+            -1 if pending_partner is None else pending_partner,
+            partial_group_requirement_mask(label.visited_mask),
         )
 
     def mandatory_remainder_info(label: PricingLabel) -> tuple[int, float, float] | None:
@@ -4926,22 +4979,122 @@ def solve_pricing_subproblem(
         if optimistic_lb >= -REDUCED_COST_TOL:
             return None
 
-        node_labels = labels_at_node[label.node]
-        surviving: list[int] = []
-        for idx in node_labels:
-            incumbent = label_store[idx]
-            if dominates(incumbent, label):
-                return None
-            if dominates(label, incumbent):
-                label_alive[idx] = False
+        label_time = label.time_after_service
+        label_load = label.load_kg
+        label_nonlabor = label.nonlabor_reduced_cost
+        label_mask = label.visited_mask
+        label_alive_local = label_alive
+        label_store_local = label_store
+        state_key = label_state_key(label)
+        visited_count = label.visited_mask.bit_count()
+        state_buckets = labels_by_state[state_key]
+        for incumbent_count in sorted(tuple(state_buckets)):
+            incumbent_bucket = state_buckets[incumbent_count]
+            incumbent_can_dominate = incumbent_count <= visited_count
+            label_can_dominate = incumbent_count >= visited_count
+            if incumbent_can_dominate and (
+                incumbent_bucket.min_time_after_service > label_time + 1e-9
+                or incumbent_bucket.min_load_kg > label_load + 1e-9
+                or incumbent_bucket.min_nonlabor_reduced_cost
+                > label_nonlabor + 1e-9
+            ):
+                incumbent_can_dominate = False
+            if label_can_dominate and (
+                incumbent_bucket.max_time_after_service < label_time - 1e-9
+                or incumbent_bucket.max_load_kg < label_load - 1e-9
+                or incumbent_bucket.max_nonlabor_reduced_cost
+                < label_nonlabor - 1e-9
+            ):
+                label_can_dominate = False
+            if not incumbent_can_dominate and not label_can_dominate:
                 continue
-            surviving.append(idx)
+
+            surviving_bucket: list[int] = []
+            bucket_min_time = float("inf")
+            bucket_min_load = float("inf")
+            bucket_min_nonlabor = float("inf")
+            bucket_max_time = -float("inf")
+            bucket_max_load = -float("inf")
+            bucket_max_nonlabor = -float("inf")
+            bucket_changed = False
+            for idx in incumbent_bucket.label_indices:
+                if not label_alive_local[idx]:
+                    bucket_changed = True
+                    continue
+                incumbent = label_store_local[idx]
+                if (
+                    incumbent_can_dominate
+                    and incumbent.time_after_service <= label_time + 1e-9
+                    and incumbent.load_kg <= label_load + 1e-9
+                    and incumbent.nonlabor_reduced_cost <= label_nonlabor + 1e-9
+                    and (incumbent.visited_mask & ~label_mask) == 0
+                ):
+                    return None
+                if (
+                    label_can_dominate
+                    and label_time <= incumbent.time_after_service + 1e-9
+                    and label_load <= incumbent.load_kg + 1e-9
+                    and label_nonlabor <= incumbent.nonlabor_reduced_cost + 1e-9
+                    and (label_mask & ~incumbent.visited_mask) == 0
+                ):
+                    label_alive_local[idx] = False
+                    bucket_changed = True
+                    continue
+                surviving_bucket.append(idx)
+                if incumbent.time_after_service < bucket_min_time:
+                    bucket_min_time = incumbent.time_after_service
+                if incumbent.load_kg < bucket_min_load:
+                    bucket_min_load = incumbent.load_kg
+                if incumbent.nonlabor_reduced_cost < bucket_min_nonlabor:
+                    bucket_min_nonlabor = incumbent.nonlabor_reduced_cost
+                if incumbent.time_after_service > bucket_max_time:
+                    bucket_max_time = incumbent.time_after_service
+                if incumbent.load_kg > bucket_max_load:
+                    bucket_max_load = incumbent.load_kg
+                if incumbent.nonlabor_reduced_cost > bucket_max_nonlabor:
+                    bucket_max_nonlabor = incumbent.nonlabor_reduced_cost
+            if surviving_bucket:
+                if bucket_changed:
+                    state_buckets[incumbent_count] = PricingLabelBucket(
+                        label_indices=surviving_bucket,
+                        min_time_after_service=bucket_min_time,
+                        min_load_kg=bucket_min_load,
+                        min_nonlabor_reduced_cost=bucket_min_nonlabor,
+                        max_time_after_service=bucket_max_time,
+                        max_load_kg=bucket_max_load,
+                        max_nonlabor_reduced_cost=bucket_max_nonlabor,
+                    )
+            else:
+                del state_buckets[incumbent_count]
 
         label_idx = len(label_store)
         label_store.append(label)
         label_alive.append(True)
-        surviving.append(label_idx)
-        labels_at_node[label.node] = surviving
+        current_bucket = state_buckets.get(visited_count)
+        if current_bucket is None:
+            state_buckets[visited_count] = PricingLabelBucket(
+                label_indices=[label_idx],
+                min_time_after_service=label.time_after_service,
+                min_load_kg=label.load_kg,
+                min_nonlabor_reduced_cost=label.nonlabor_reduced_cost,
+                max_time_after_service=label.time_after_service,
+                max_load_kg=label.load_kg,
+                max_nonlabor_reduced_cost=label.nonlabor_reduced_cost,
+            )
+        else:
+            current_bucket.label_indices.append(label_idx)
+            if label.time_after_service < current_bucket.min_time_after_service:
+                current_bucket.min_time_after_service = label.time_after_service
+            if label.load_kg < current_bucket.min_load_kg:
+                current_bucket.min_load_kg = label.load_kg
+            if label.nonlabor_reduced_cost < current_bucket.min_nonlabor_reduced_cost:
+                current_bucket.min_nonlabor_reduced_cost = label.nonlabor_reduced_cost
+            if label.time_after_service > current_bucket.max_time_after_service:
+                current_bucket.max_time_after_service = label.time_after_service
+            if label.load_kg > current_bucket.max_load_kg:
+                current_bucket.max_load_kg = label.load_kg
+            if label.nonlabor_reduced_cost > current_bucket.max_nonlabor_reduced_cost:
+                current_bucket.max_nonlabor_reduced_cost = label.nonlabor_reduced_cost
         heapq.heappush(frontier, (optimistic_lb, label.reduced_cost, label_idx))
         return label_idx
 
@@ -5303,6 +5456,12 @@ def add_route_column_to_master(node_master: NodeMasterLP, route: RouteColumn) ->
     return route_var
 
 
+def node_pricing_batch_size(node_label: str, base_count: int) -> int:
+    if node_label in {"root", "node depth 0"}:
+        return max(base_count * ROOT_PRICING_COLUMNS_MULTIPLIER, ROOT_PRICING_COLUMNS_MIN)
+    return base_count
+
+
 def solve_node_relaxation(
     instance: Instance,
     vehicle_types: dict[str, VehicleTypeData],
@@ -5422,6 +5581,8 @@ def solve_node_relaxation(
         if pricing_workers is not None
         else min(os.cpu_count() or 1, len(vehicle_types))
     )
+    if ROUTE_BASED_PARTIAL_PRICING:
+        effective_pricing_workers = 1
     pricing_executor: ProcessPoolExecutor | None = None
     if effective_pricing_workers > 1:
         pricing_executor = ProcessPoolExecutor(
@@ -5436,8 +5597,50 @@ def solve_node_relaxation(
                 f"{effective_pricing_workers} worker processes",
                 force=True,
             )
+    elif progress is not None and ROUTE_BASED_PARTIAL_PRICING:
+        progress.emit(
+            f"{node_label}: using sequential partial pricing sweeps across vehicle types",
+            force=True,
+        )
+
+    pricing_batch_size = node_pricing_batch_size(node_label, pricing_columns_per_type)
+
+    vehicle_type_list = list(vehicle_types.values())
+    pricing_start_index = 0
+
+    def price_vehicle_type(
+        vehicle_type: VehicleTypeData,
+        *,
+        cover_duals: dict[int, float],
+        type_dual: float,
+        raw_pricing: bool,
+        iteration_number: int,
+    ) -> list[RouteColumn]:
+        if progress is not None:
+            prefix = "raw pricing" if raw_pricing else "pricing"
+            progress.emit(
+                f"{node_label}: CG iteration {iteration_number}, {prefix} "
+                f"{vehicle_type.type_id} at LP bound {last_lp_objective:.2f}"
+            )
+        return solve_pricing_subproblem(
+            instance=instance,
+            vehicle_type=vehicle_type,
+            cover_duals=cover_duals,
+            type_dual=type_dual,
+            branch_ctx=branch_ctx,
+            max_routes=pricing_batch_size,
+            excluded_stop_sequences=route_sequences_by_type[vehicle_type.type_id],
+            pricing_time_limit=pricing_time_limit,
+            deadline=deadline,
+            progress=progress,
+            progress_label=(
+                f"{node_label}: {'raw pricing' if raw_pricing else 'pricing'} "
+                f"{vehicle_type.type_id} in CG iteration {iteration_number}"
+            ),
+        )
 
     def collect_candidate_routes(
+        vehicle_types_to_price: list[VehicleTypeData],
         cover_duals: dict[int, float],
         type_duals: dict[str, float],
         *,
@@ -5446,35 +5649,20 @@ def solve_node_relaxation(
     ) -> dict[str, list[RouteColumn]]:
         if pricing_executor is None:
             routes_by_type: dict[str, list[RouteColumn]] = {}
-            for vehicle_type in vehicle_types.values():
-                if progress is not None:
-                    prefix = "raw pricing" if raw_pricing else "pricing"
-                    progress.emit(
-                        f"{node_label}: CG iteration {iteration_number}, {prefix} "
-                        f"{vehicle_type.type_id} at LP bound {last_lp_objective:.2f}"
-                    )
-                routes_by_type[vehicle_type.type_id] = solve_pricing_subproblem(
-                    instance=instance,
-                    vehicle_type=vehicle_type,
+            for vehicle_type in vehicle_types_to_price:
+                routes_by_type[vehicle_type.type_id] = price_vehicle_type(
+                    vehicle_type,
                     cover_duals=cover_duals,
                     type_dual=type_duals[vehicle_type.type_id],
-                    branch_ctx=branch_ctx,
-                    max_routes=pricing_columns_per_type,
-                    excluded_stop_sequences=route_sequences_by_type[vehicle_type.type_id],
-                    pricing_time_limit=pricing_time_limit,
-                    deadline=deadline,
-                    progress=progress,
-                    progress_label=(
-                        f"{node_label}: {'raw pricing' if raw_pricing else 'pricing'} "
-                        f"{vehicle_type.type_id} in CG iteration {iteration_number}"
-                    ),
+                    raw_pricing=raw_pricing,
+                    iteration_number=iteration_number,
                 )
             return routes_by_type
 
         if progress is not None:
             progress.emit(
                 f"{node_label}: CG iteration {iteration_number}, running "
-                f"{'raw ' if raw_pricing else ''}pricing for {len(vehicle_types)} vehicle types "
+                f"{'raw ' if raw_pricing else ''}pricing for {len(vehicle_types_to_price)} vehicle types "
                 f"in parallel"
             )
 
@@ -5484,15 +5672,15 @@ def solve_node_relaxation(
                 vehicle_type,
                 cover_duals,
                 type_duals[vehicle_type.type_id],
-                pricing_columns_per_type,
+                pricing_batch_size,
                 set(route_sequences_by_type[vehicle_type.type_id]),
                 pricing_time_limit,
                 deadline,
             )
-            for vehicle_type in vehicle_types.values()
+            for vehicle_type in vehicle_types_to_price
         }
         routes_by_type: dict[str, list[RouteColumn]] = {}
-        for vehicle_type in vehicle_types.values():
+        for vehicle_type in vehicle_types_to_price:
             type_id, routes = future_by_type_id[vehicle_type.type_id].result()
             routes_by_type[type_id] = routes
         return routes_by_type
@@ -5586,7 +5774,7 @@ def solve_node_relaxation(
                 inactive_routes_by_type=inactive_routes_by_type,
                 cover_duals=raw_cover_duals,
                 type_duals=raw_type_duals,
-                max_per_type=pricing_columns_per_type,
+                max_per_type=pricing_batch_size,
             )
             for route in reactivated_routes:
                 key = route_column_key(route)
@@ -5611,15 +5799,21 @@ def solve_node_relaxation(
                 emit_checkpoint()
                 continue
 
-            found_raw_improving_route = False
-            pricing_results = collect_candidate_routes(
-                cover_duals=stabilized_cover_duals,
-                type_duals=stabilized_type_duals,
-                raw_pricing=False,
-                iteration_number=iteration,
-            )
-            for vehicle_type in vehicle_types.values():
-                candidate_routes = pricing_results[vehicle_type.type_id]
+            type_scan_order = [
+                vehicle_type_list[(pricing_start_index + offset) % len(vehicle_type_list)]
+                for offset in range(len(vehicle_type_list))
+            ]
+            found_new_route = False
+            improving_type_index: int | None = None
+            for ordered_index, vehicle_type in enumerate(type_scan_order):
+                candidate_routes = collect_candidate_routes(
+                    vehicle_types_to_price=[vehicle_type],
+                    cover_duals=stabilized_cover_duals,
+                    type_duals=stabilized_type_duals,
+                    raw_pricing=False,
+                    iteration_number=iteration,
+                )[vehicle_type.type_id]
+                found_raw_improving_route = False
                 for route in candidate_routes:
                     if (
                         route_reduced_cost(
@@ -5641,20 +5835,21 @@ def solve_node_relaxation(
                     add_route_column_to_master(node_master, route)
                     found_raw_improving_route = True
 
-            if not found_raw_improving_route and current_alpha < 1.0 - 1e-12:
-                if progress is not None:
-                    progress.emit(
-                        f"{node_label}: CG iteration {iteration}, no raw-improving routes found "
-                        "under stabilized pricing; certifying with raw dual pricing"
-                    )
-                raw_pricing_results = collect_candidate_routes(
-                    cover_duals=raw_cover_duals,
-                    type_duals=raw_type_duals,
-                    raw_pricing=True,
-                    iteration_number=iteration,
-                )
-                for vehicle_type in vehicle_types.values():
-                    for route in raw_pricing_results[vehicle_type.type_id]:
+                if not found_raw_improving_route and current_alpha < 1.0 - 1e-12:
+                    if progress is not None:
+                        progress.emit(
+                            f"{node_label}: CG iteration {iteration}, no raw-improving routes "
+                            f"found for {vehicle_type.type_id} under stabilized pricing; "
+                            "certifying with raw dual pricing"
+                        )
+                    raw_pricing_results = collect_candidate_routes(
+                        vehicle_types_to_price=[vehicle_type],
+                        cover_duals=raw_cover_duals,
+                        type_duals=raw_type_duals,
+                        raw_pricing=True,
+                        iteration_number=iteration,
+                    )[vehicle_type.type_id]
+                    for route in raw_pricing_results:
                         key = (route.type_id, route.stop_sequence)
                         if key in route_key_set:
                             continue
@@ -5664,6 +5859,13 @@ def solve_node_relaxation(
                         route_pool.append(route)
                         new_routes.append(route)
                         add_route_column_to_master(node_master, route)
+
+                if new_routes:
+                    found_new_route = True
+                    improving_type_index = (
+                        pricing_start_index + ordered_index
+                    ) % len(vehicle_type_list)
+                    break
 
             if not new_routes:
                 artificial_usage = sum(
@@ -5680,6 +5882,8 @@ def solve_node_relaxation(
                     cg_iterations=iteration,
                 )
 
+            if found_new_route and improving_type_index is not None:
+                pricing_start_index = (improving_type_index + 1) % len(vehicle_type_list)
             if progress is not None:
                 progress.emit(
                     f"{node_label}: CG iteration {iteration} added {len(new_routes)} routes; "
@@ -5966,7 +6170,7 @@ def select_fractional_assignment(
 
 def create_model(
     workbook_path: Path,
-    max_cg_iterations: int | None = 200,
+    max_cg_iterations: int | None = 5000,
     pricing_time_limit: float | None = None,
     pricing_columns_per_type: int = 3,
     pricing_workers: int | None = None,
@@ -6829,7 +7033,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-cg-iterations",
         type=parse_optional_int_limit,
-        default=200,
+        default=5000,
         help=(
             "Maximum column-generation iterations allowed at each tree node. "
             "Use 0, 'none', or 'unlimited' for no cap. Only used with --route-based."
@@ -6974,7 +7178,7 @@ def main() -> None:
     selected_mip_profile: ArcFlowMIPProfile | None = None
     route_based_only_overrides: list[str] = []
     if not route_based_enabled:
-        if args.max_cg_iterations != 200:
+        if args.max_cg_iterations != 5000:
             route_based_only_overrides.append("--max-cg-iterations")
         if args.pricing_time_limit is not None:
             route_based_only_overrides.append("--pricing-time-limit")
