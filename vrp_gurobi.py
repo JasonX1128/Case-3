@@ -56,7 +56,7 @@ EXACT_PRICING_NATIVE_MIN_BUCKET_SIZE = 2
 EXACT_PRICING_NUMPY_MIN_BUCKET_SIZE = 16
 # Bump whenever the default arc-flow MIP variable set or feasibility logic changes
 # in a way that can invalidate persisted .mst/.sol starts.
-DEFAULT_MIP_FORMULATION_VERSION = 4
+DEFAULT_MIP_FORMULATION_VERSION = 5
 DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
 DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT = 1.0
 _NATIVE_PRICING_LIBRARY: Any | None | bool = None
@@ -251,7 +251,26 @@ class StopAllowedVehicleTypesRule:
     description: str
 
 
+@dataclass(frozen=True)
+class TravelTimeAdjustmentRule:
+    affected_stops: frozenset[int]
+    extra_minutes_per_leg: float
+    description: str
+
+
 HILLCREST_SMALL_VAN_ONLY_STOPS: tuple[int, ...] = (18, 19, 20, 21, 22)
+MAIN_STREET_CONSTRUCTION_STOPS: frozenset[int] = frozenset({1, 2, 3, 4, 5, 6})
+# Stop 19 may also sit on Main Street, but per the current instruction we
+# intentionally do not include it in the coded construction-delay rule yet.
+MAIN_STREET_CONSTRUCTION_RULE = TravelTimeAdjustmentRule(
+    affected_stops=MAIN_STREET_CONSTRUCTION_STOPS,
+    extra_minutes_per_leg=20.0,
+    description=(
+        "Main Street construction assumption: treat every plan as a Monday-Thursday "
+        "construction day, and add 20 minutes to any travel leg that goes to or "
+        "from Stops 1-6."
+    ),
+)
 
 
 REDSTONE_PLAZA_PAIR_RULES: tuple[RequiredAdjacentStopPairRule, ...] = (
@@ -2729,6 +2748,7 @@ def load_instance(workbook_path: Path) -> Instance:
         for col_offset, to_node in enumerate(node_ids, start=2):
             distance_miles[from_node, to_node] = float(ws_dist.cell(row_offset, col_offset).value)
             travel_minutes[from_node, to_node] = float(ws_time.cell(row_offset, col_offset).value)
+    travel_minutes = apply_business_rule_travel_time_adjustments(travel_minutes)
 
     cost_params: dict[str, float] = {}
     for row in range(2, ws_cost.max_row + 1):
@@ -2884,9 +2904,27 @@ def active_business_rule_descriptions() -> list[str]:
         add(rule.description)
     for rule in STOP_ALLOWED_VEHICLE_TYPE_RULES:
         add(rule.description)
+    add(MAIN_STREET_CONSTRUCTION_RULE.description)
     if MIDDAY_LUNCH_BREAK_RULE is not None:
         add(MIDDAY_LUNCH_BREAK_RULE.description)
     return descriptions
+
+
+def apply_business_rule_travel_time_adjustments(
+    travel_minutes: dict[tuple[int, int], float]
+) -> dict[tuple[int, int], float]:
+    adjusted_travel_minutes = dict(travel_minutes)
+    for (from_node, to_node), base_minutes in travel_minutes.items():
+        if from_node == to_node:
+            continue
+        if (
+            from_node in MAIN_STREET_CONSTRUCTION_RULE.affected_stops
+            or to_node in MAIN_STREET_CONSTRUCTION_RULE.affected_stops
+        ):
+            adjusted_travel_minutes[from_node, to_node] = (
+                base_minutes + MAIN_STREET_CONSTRUCTION_RULE.extra_minutes_per_leg
+            )
+    return adjusted_travel_minutes
 
 
 def hard_service_start_lb(stop_id: int) -> float | None:
