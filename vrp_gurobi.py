@@ -5104,11 +5104,21 @@ def solve_pricing_subproblem(
         label_visited_mask_array = np.empty(label_capacity, dtype=np.uint64)
         label_alive_array = np.zeros(label_capacity, dtype=np.uint8)
         survivor_index_buffer = np.empty(label_capacity, dtype=np.int32)
+        label_time_ptr = label_time_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        label_load_ptr = label_load_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        label_nonlabor_ptr = label_nonlabor_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        label_mask_ptr = label_visited_mask_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64))
+        label_alive_ptr = label_alive_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        survivor_index_buffer_ptr = survivor_index_buffer.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_int32)
+        )
 
         def ensure_label_capacity(required_size: int) -> None:
             nonlocal label_capacity, label_time_array, label_load_array
             nonlocal label_nonlabor_array, label_visited_mask_array, label_alive_array
             nonlocal survivor_index_buffer
+            nonlocal label_time_ptr, label_load_ptr, label_nonlabor_ptr
+            nonlocal label_mask_ptr, label_alive_ptr, survivor_index_buffer_ptr
             if required_size <= label_capacity:
                 return
             new_capacity = label_capacity
@@ -5132,6 +5142,18 @@ def solve_pricing_subproblem(
             new_survivor_buffer = np.empty(new_capacity, dtype=np.int32)
             new_survivor_buffer[: len(label_store)] = survivor_index_buffer[: len(label_store)]
             survivor_index_buffer = new_survivor_buffer
+            label_time_ptr = label_time_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+            label_load_ptr = label_load_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+            label_nonlabor_ptr = label_nonlabor_array.ctypes.data_as(
+                ctypes.POINTER(ctypes.c_double)
+            )
+            label_mask_ptr = label_visited_mask_array.ctypes.data_as(
+                ctypes.POINTER(ctypes.c_uint64)
+            )
+            label_alive_ptr = label_alive_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+            survivor_index_buffer_ptr = survivor_index_buffer.ctypes.data_as(
+                ctypes.POINTER(ctypes.c_int32)
+            )
             label_capacity = new_capacity
 
         def bucket_index_array(bucket: PricingLabelBucket) -> Any:
@@ -5478,18 +5500,18 @@ def solve_pricing_subproblem(
                 incumbent_dominates = native_dominance_helper(
                     idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
                     idx_array.size,
-                    label_time_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                    label_load_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                    label_nonlabor_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                    label_visited_mask_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
-                    label_alive_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                    label_time_ptr,
+                    label_load_ptr,
+                    label_nonlabor_ptr,
+                    label_mask_ptr,
+                    label_alive_ptr,
                     label_time,
                     label_load,
                     label_nonlabor,
                     ctypes.c_uint64(label_mask),
                     int(incumbent_can_dominate),
                     int(label_can_dominate),
-                    survivor_index_buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                    survivor_index_buffer_ptr,
                     ctypes.byref(survivor_count),
                 )
                 if incumbent_dominates:
