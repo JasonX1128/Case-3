@@ -644,34 +644,45 @@ class MIPPersistenceManager:
 
     def __init__(self, path: Path) -> None:
         self.path = path.resolve()
+        self.resume_mip_start_path = self.path / "resume.mst"
         self.resume_solution_path = self.path / "resume.sol"
-        self.solution_prefix = self.path / "incumbent"
+        self.runs_dir = self.path / "runs"
+        self.current_run_dir: Path | None = None
+        self.solution_prefix: Path | None = None
         self.state_path = self.path / "state.json"
+        self.last_saved_resume_objective: float | None = None
 
     def ensure_dir(self) -> None:
         self.path.mkdir(parents=True, exist_ok=True)
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
 
-    def _autosave_solution_paths(self) -> list[Path]:
-        solution_paths: list[tuple[int, Path]] = []
-        for candidate in self.path.glob("incumbent_*.sol"):
+    def _autosave_solution_paths(self, root: Path | None = None) -> list[Path]:
+        search_root = self.path if root is None else root
+        solution_paths: list[tuple[float, str, Path]] = []
+        for candidate in search_root.rglob("incumbent_*.sol"):
             suffix = candidate.stem.removeprefix("incumbent_")
             if not suffix.isdigit():
                 continue
-            solution_paths.append((int(suffix), candidate))
-        return [path for _, path in sorted(solution_paths)]
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            solution_paths.append((mtime, str(candidate), candidate))
+        return [path for _, _, path in sorted(solution_paths)]
 
-    def latest_autosave_solution_path(self) -> Path | None:
-        solution_paths = self._autosave_solution_paths()
+    def latest_autosave_solution_path(self, root: Path | None = None) -> Path | None:
+        solution_paths = self._autosave_solution_paths(root)
         if solution_paths:
             return solution_paths[-1]
         return None
 
-    def _cleanup_autosave_files(self) -> None:
-        for candidate in self._autosave_solution_paths():
+    def _cleanup_autosave_files(self, root: Path | None = None) -> None:
+        for candidate in self._autosave_solution_paths(root):
             candidate.unlink(missing_ok=True)
 
     def _clear_saved_starts(self) -> None:
         self._cleanup_autosave_files()
+        self.resume_mip_start_path.unlink(missing_ok=True)
         self.resume_solution_path.unlink(missing_ok=True)
 
     def _read_state(self) -> dict[str, Any] | None:
@@ -686,6 +697,62 @@ class MIPPersistenceManager:
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
         temp_path.replace(self.state_path)
+
+    def maybe_write_resume_mip_start(
+        self,
+        *,
+        objective: float | None,
+        min_improvement: float,
+        named_values: list[tuple[str, float]],
+        force: bool = False,
+    ) -> Path | None:
+        if objective is None:
+            return None
+        threshold = max(float(min_improvement), 0.0)
+        if (
+            not force
+            and self.last_saved_resume_objective is not None
+            and self.last_saved_resume_objective - objective < threshold - 1e-9
+        ):
+            return None
+
+        self.ensure_dir()
+        temp_path = self.resume_mip_start_path.with_suffix(".mst.tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            handle.write("# MIP start\n")
+            for var_name, value in named_values:
+                handle.write(f"{var_name} {value}\n")
+        temp_path.replace(self.resume_mip_start_path)
+        self.last_saved_resume_objective = objective
+        return self.resume_mip_start_path
+
+    def _start_candidate_paths(self, prior_state: dict[str, Any] | None) -> list[Path]:
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+
+        def add(candidate: Path | None) -> None:
+            if candidate is None:
+                return
+            resolved = candidate.resolve()
+            if resolved in seen or not resolved.is_file():
+                return
+            seen.add(resolved)
+            candidates.append(resolved)
+
+        add(self.resume_mip_start_path)
+        add(self.resume_solution_path)
+        if prior_state is not None:
+            resume_mst_path = prior_state.get("resume_mip_start_path")
+            resume_path = prior_state.get("resume_solution_path")
+            latest_path = prior_state.get("latest_solution_path")
+            if isinstance(resume_mst_path, str):
+                add(Path(resume_mst_path))
+            if isinstance(resume_path, str):
+                add(Path(resume_path))
+            if isinstance(latest_path, str):
+                add(Path(latest_path))
+        add(self.latest_autosave_solution_path())
+        return candidates
 
     def _checkpoint_payload(
         self,
@@ -706,11 +773,17 @@ class MIPPersistenceManager:
             "workbook_path": str(workbook_path.resolve()),
             "status": status,
             "loaded_start_path": None if loaded_start_path is None else str(loaded_start_path),
+            "resume_mip_start_path": (
+                str(self.resume_mip_start_path) if self.resume_mip_start_path.is_file() else None
+            ),
             "resume_solution_path": (
                 str(self.resume_solution_path) if self.resume_solution_path.is_file() else None
             ),
             "latest_solution_path": (
                 None if latest_solution_path is None else str(latest_solution_path.resolve())
+            ),
+            "autosave_dir": (
+                None if self.current_run_dir is None else str(self.current_run_dir.resolve())
             ),
             "objective": objective,
             "best_bound": best_bound,
@@ -743,24 +816,28 @@ class MIPPersistenceManager:
                 self._clear_saved_starts()
                 skip_saved_start = True
 
-        if not skip_saved_start and not self.resume_solution_path.is_file():
-            latest_autosave = self.latest_autosave_solution_path()
-            if latest_autosave is not None:
-                shutil.copy2(latest_autosave, self.resume_solution_path)
-
         loaded_start_path: Path | None = None
-        if not skip_saved_start and self.resume_solution_path.is_file():
-            try:
-                model.update()
-                model.read(str(self.resume_solution_path))
-                loaded_start_path = self.resume_solution_path
-            except gp.GurobiError as exc:
-                print(
-                    "Warning: could not load saved MIP start from "
-                    f"{self.resume_solution_path}; starting fresh ({exc})."
-                )
+        if not skip_saved_start:
+            for candidate in self._start_candidate_paths(prior_state):
+                try:
+                    model.update()
+                    model.read(str(candidate))
+                    loaded_start_path = candidate
+                    if candidate.suffix == ".mst":
+                        if candidate != self.resume_mip_start_path:
+                            shutil.copy2(candidate, self.resume_mip_start_path)
+                    elif candidate != self.resume_solution_path:
+                        shutil.copy2(candidate, self.resume_solution_path)
+                    break
+                except (OSError, gp.GurobiError) as exc:
+                    print(
+                        "Warning: could not load saved MIP start from "
+                        f"{candidate}; trying next candidate ({exc})."
+                    )
 
-        self._cleanup_autosave_files()
+        self.current_run_dir = self.runs_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.current_run_dir.mkdir(parents=True, exist_ok=True)
+        self.solution_prefix = self.current_run_dir / "incumbent"
         model.Params.SolFiles = str(self.solution_prefix)
         self._write_state(
             self._checkpoint_payload(
@@ -786,16 +863,24 @@ class MIPPersistenceManager:
         best_bound: float | None,
         gap: float | None,
         note: str,
+        model: gp.Model | None = None,
     ) -> Path | None:
         self.ensure_dir()
 
-        latest_solution_path = self.latest_autosave_solution_path()
+        latest_solution_path = self.latest_autosave_solution_path(self.current_run_dir)
+        if model is not None:
+            try:
+                model.write(str(self.resume_mip_start_path))
+            except gp.GurobiError:
+                pass
         if latest_solution_path is not None:
             shutil.copy2(latest_solution_path, self.resume_solution_path)
-        elif not self.resume_solution_path.is_file():
-            self.resume_solution_path = self.path / "resume.sol"
 
-        resume_path = self.resume_solution_path if self.resume_solution_path.is_file() else None
+        resume_path = None
+        if self.resume_mip_start_path.is_file():
+            resume_path = self.resume_mip_start_path
+        elif self.resume_solution_path.is_file():
+            resume_path = self.resume_solution_path
         self._write_state(
             self._checkpoint_payload(
                 workbook_path=workbook_path,
@@ -3218,13 +3303,43 @@ def solve_arc_flow_model(
             model.Params.MIPGap = mip_gap
         if persistence_manager is not None:
             loaded_start_path = persistence_manager.load_start(model, workbook_path)
+        mip_start_vars = [
+            (var.VarName, var, var.VType)
+            for var in model.getVars()
+            if var.VType in {GRB.BINARY, GRB.INTEGER, GRB.SEMIINT}
+        ]
 
         def maybe_save_mip_incumbent_report(cb_model: gp.Model) -> None:
             try:
-                if incumbent_report_writer is None:
-                    return
                 objective = float(cb_model.cbGet(GRB.Callback.MIPSOL_OBJ))
-                if not incumbent_report_writer.should_save(objective):
+                report_should_save = (
+                    incumbent_report_writer is not None
+                    and incumbent_report_writer.should_save(objective)
+                )
+                if persistence_manager is not None:
+                    saved_mst_path = persistence_manager.maybe_write_resume_mip_start(
+                        objective=objective,
+                        min_improvement=(
+                            incumbent_report_writer.min_improvement
+                            if incumbent_report_writer is not None
+                            else DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT
+                        ),
+                        named_values=[
+                            (
+                                var_name,
+                                float(int(round(cb_model.cbGetSolution(var))))
+                                if var_type in {GRB.BINARY, GRB.INTEGER, GRB.SEMIINT}
+                                else float(cb_model.cbGetSolution(var)),
+                            )
+                            for var_name, var, var_type in mip_start_vars
+                        ],
+                    )
+                    if saved_mst_path is not None and progress is not None:
+                        progress.emit(
+                            f"arc-flow master MIP: refreshed resume MIP start at {saved_mst_path}",
+                            force=True,
+                        )
+                if not report_should_save:
                     return
                 best_bound = MIPBoundLogger._normalize_bound(cb_model.cbGet(GRB.Callback.MIPSOL_OBJBND))
                 gap = relative_gap(objective, best_bound)
@@ -3279,6 +3394,7 @@ def solve_arc_flow_model(
                     best_bound=interrupted_best_bound,
                     gap=interrupted_gap,
                     note="Arc-flow MIP interrupted",
+                    model=model,
                 )
             if incumbent_report_writer is not None and incumbent_report_writer.path is not None:
                 record_interrupt_artifact("incumbent_report", incumbent_report_writer.path)
@@ -3327,6 +3443,7 @@ def solve_arc_flow_model(
                 best_bound=result.best_bound,
                 gap=result.gap,
                 note="Arc-flow MIP finished",
+                model=model,
             )
 
         if trace_logger is not None:
@@ -5985,7 +6102,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Autosave directory for the default arc-flow MIP. "
-            "The solver writes intermediate incumbent .sol files there during the run, "
+            "The solver writes intermediate incumbent .sol files into timestamped runs/ "
+            "subdirectories there during the run, "
             "keeps a reusable resume.sol, and automatically reloads that start on later runs. "
             "Defaults to .mip_persist/<workbook-stem> beside the workbook. "
             "Only used without --route-based."
