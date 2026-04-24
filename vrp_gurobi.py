@@ -158,6 +158,20 @@ MIDDAY_LUNCH_BREAK_RULE = MandatoryLunchBreakRule(
     ),
 )
 
+CONSTRUCTIVE_ARC_FLOW_SEED_BY_VEHICLE_TYPE: dict[str, tuple[tuple[int, ...], ...]] = {
+    "Small Van": (
+        (5, 22, 18),
+        (20, 19, 21),
+    ),
+    "Medium Truck": (
+        (1, 9, 11, 15, 10, 12, 16, 17, 26),
+        (4, 24, 6, 28, 25, 23),
+    ),
+    "Large Truck": (
+        (7, 8, 13, 2, 14, 27, 3),
+    ),
+}
+
 REQUIRED_ADJACENT_STOP_PARTNER: dict[int, int] = {
     stop_id: partner_id
     for rule in REDSTONE_PLAZA_PAIR_RULES
@@ -2529,6 +2543,83 @@ def evaluate_route_sequence(
     return best_route
 
 
+def build_constructive_arc_flow_seed(
+    instance: Instance,
+) -> list[tuple[int, RouteColumn, VehicleTypeData]] | None:
+    vehicle_types = build_vehicle_types(instance)
+    vehicle_types_by_name: dict[str, list[VehicleTypeData]] = defaultdict(list)
+    for vehicle_type in vehicle_types.values():
+        vehicle_types_by_name[vehicle_type.vehicle_type].append(vehicle_type)
+    for candidate_types in vehicle_types_by_name.values():
+        candidate_types.sort(key=lambda candidate: min(candidate.vehicle_ids))
+
+    available_vehicle_ids: dict[str, list[int]] = {
+        vehicle_type.type_id: list(vehicle_type.vehicle_ids)
+        for vehicle_type in vehicle_types.values()
+    }
+    assignments: list[tuple[int, RouteColumn, VehicleTypeData]] = []
+    covered_stops: list[int] = []
+
+    for vehicle_type_name, route_sequences in CONSTRUCTIVE_ARC_FLOW_SEED_BY_VEHICLE_TYPE.items():
+        candidate_types = vehicle_types_by_name.get(vehicle_type_name, [])
+        if not candidate_types:
+            return None
+        for stop_sequence in route_sequences:
+            chosen_route: RouteColumn | None = None
+            chosen_vehicle_type: VehicleTypeData | None = None
+            for candidate_type in candidate_types:
+                if not available_vehicle_ids[candidate_type.type_id]:
+                    continue
+                route = evaluate_route_sequence(instance, candidate_type, stop_sequence)
+                if route is None:
+                    continue
+                if sum(route.late_min.values()) > 1e-6:
+                    continue
+                chosen_route = route
+                chosen_vehicle_type = candidate_type
+                break
+            if chosen_route is None or chosen_vehicle_type is None:
+                return None
+            vehicle_id = available_vehicle_ids[chosen_vehicle_type.type_id].pop(0)
+            assignments.append((vehicle_id, chosen_route, chosen_vehicle_type))
+            covered_stops.extend(stop_sequence)
+
+    if len(covered_stops) != len(instance.stops):
+        return None
+    if set(covered_stops) != set(instance.stops):
+        return None
+    return assignments
+
+
+def apply_constructive_arc_flow_mip_start(
+    instance: Instance,
+    data: dict[str, Any],
+) -> bool:
+    assignments = build_constructive_arc_flow_seed(instance)
+    if assignments is None:
+        return False
+
+    x = data["x"]
+    visit = data["visit"]
+    use_vehicle = data["use_vehicle"]
+    stop_ids = data["stop_ids"]
+    vehicle_ids = data["vehicle_ids"]
+
+    for var in x.values():
+        var.Start = GRB.UNDEFINED
+    for var in visit.values():
+        var.Start = 0.0
+    for var in use_vehicle.values():
+        var.Start = 0.0
+
+    for vehicle_id, route, _vehicle_type in assignments:
+        use_vehicle[vehicle_id].Start = 1.0
+        for stop_id in route.stop_sequence:
+            visit[vehicle_id, stop_id].Start = 1.0
+
+    return True
+
+
 def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     validate_shared_cost_assumptions(instance)
 
@@ -3519,6 +3610,22 @@ def solve_arc_flow_model(
             model.Params.MIPGap = mip_gap
         if persistence_manager is not None:
             loaded_start_path = persistence_manager.load_start(model, workbook_path)
+        applied_constructive_seed = False
+        if loaded_start_path is None:
+            applied_constructive_seed = apply_constructive_arc_flow_mip_start(instance, data)
+            if applied_constructive_seed:
+                model.Params.StartNodeLimit = max(int(getattr(model.Params, "StartNodeLimit", 0)), 5000)
+                model.update()
+                if progress is not None:
+                    progress.emit(
+                        "arc-flow master MIP: applied built-in constructive MIP start with elevated start repair effort",
+                        force=True,
+                    )
+                else:
+                    print(
+                        "Applied built-in constructive MIP start with elevated start repair effort.",
+                        flush=True,
+                    )
         mip_start_vars = [
             (var.VarName, var, var.VType)
             for var in model.getVars()
