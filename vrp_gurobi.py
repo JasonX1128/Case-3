@@ -3085,7 +3085,12 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                     service_start_min[stop_id] + stop.service_min
                     <= lunch_start_min[vehicle_id]
                     + lunch_big_m
-                    * (served_after_lunch[vehicle_id, stop_id] + 1 - visit[vehicle_id, stop_id]),
+                    * (
+                        served_after_lunch[vehicle_id, stop_id]
+                        + 2
+                        - visit[vehicle_id, stop_id]
+                        - lunch_required[vehicle_id]
+                    ),
                     name=f"served_before_lunch[{vehicle_id},{stop_id}]",
                 )
                 model.addConstr(
@@ -3093,7 +3098,12 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                     >= lunch_start_min[vehicle_id]
                     + MIDDAY_LUNCH_BREAK_RULE.duration_min
                     - lunch_big_m
-                    * (2 - served_after_lunch[vehicle_id, stop_id] - visit[vehicle_id, stop_id]),
+                    * (
+                        3
+                        - served_after_lunch[vehicle_id, stop_id]
+                        - visit[vehicle_id, stop_id]
+                        - lunch_required[vehicle_id]
+                    ),
                     name=f"served_after_lunch[{vehicle_id},{stop_id}]",
                 )
             model.addConstr(
