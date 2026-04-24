@@ -52,29 +52,31 @@ ROOT_BOOTSTRAP_TIME_FRACTION = 0.20
 ROOT_BOOTSTRAP_ROUTES_PER_TYPE = 18
 ROOT_PRICING_EXTRA_SWEEPS = 8
 ROOT_PRICING_TARGET_NEW_ROUTES_PER_LP = 24
-EXACT_PRICING_NATIVE_MIN_BUCKET_SIZE = 8
+EXACT_PRICING_NATIVE_MIN_BUCKET_SIZE = 2
 EXACT_PRICING_NUMPY_MIN_BUCKET_SIZE = 16
 # Bump whenever the default arc-flow MIP variable set or feasibility logic changes
 # in a way that can invalidate persisted .mst/.sol starts.
 DEFAULT_MIP_FORMULATION_VERSION = 4
 DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
 DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT = 1.0
+_NATIVE_PRICING_LIBRARY: Any | None | bool = None
 _NATIVE_PRICING_HELPER: Any | None | bool = None
+_NATIVE_PRICING_REWARD_HELPER: Any | None | bool = None
 
 
-def native_pricing_helper() -> Any | None:
-    global _NATIVE_PRICING_HELPER
-    if _NATIVE_PRICING_HELPER is False:
+def native_pricing_library() -> Any | None:
+    global _NATIVE_PRICING_LIBRARY
+    if _NATIVE_PRICING_LIBRARY is False:
         return None
-    if _NATIVE_PRICING_HELPER is not None:
-        return _NATIVE_PRICING_HELPER
+    if _NATIVE_PRICING_LIBRARY is not None:
+        return _NATIVE_PRICING_LIBRARY
     if np is None:
-        _NATIVE_PRICING_HELPER = False
+        _NATIVE_PRICING_LIBRARY = False
         return None
 
     source_path = Path(__file__).with_name("native_pricing_helper.c")
     if not source_path.is_file():
-        _NATIVE_PRICING_HELPER = False
+        _NATIVE_PRICING_LIBRARY = False
         return None
 
     cache_dir = Path(__file__).resolve().parent / ".native_cache"
@@ -111,11 +113,30 @@ def native_pricing_helper() -> Any | None:
         except Exception:
             temp_binary_path.unlink(missing_ok=True)
             if not binary_path.is_file():
-                _NATIVE_PRICING_HELPER = False
+                _NATIVE_PRICING_LIBRARY = False
                 return None
 
     try:
         library = ctypes.CDLL(str(binary_path))
+    except Exception:
+        _NATIVE_PRICING_LIBRARY = False
+        return None
+
+    _NATIVE_PRICING_LIBRARY = library
+    return library
+
+
+def native_pricing_helper() -> Any | None:
+    global _NATIVE_PRICING_HELPER
+    if _NATIVE_PRICING_HELPER is False:
+        return None
+    if _NATIVE_PRICING_HELPER is not None:
+        return _NATIVE_PRICING_HELPER
+    library = native_pricing_library()
+    if library is None:
+        _NATIVE_PRICING_HELPER = False
+        return None
+    try:
         function = library.pricing_dominance_scan
         function.argtypes = [
             ctypes.POINTER(ctypes.c_int32),
@@ -138,8 +159,46 @@ def native_pricing_helper() -> Any | None:
     except Exception:
         _NATIVE_PRICING_HELPER = False
         return None
-
     _NATIVE_PRICING_HELPER = function
+    return function
+
+
+def native_pricing_reward_helper() -> Any | None:
+    global _NATIVE_PRICING_REWARD_HELPER
+    if _NATIVE_PRICING_REWARD_HELPER is False:
+        return None
+    if _NATIVE_PRICING_REWARD_HELPER is not None:
+        return _NATIVE_PRICING_REWARD_HELPER
+    library = native_pricing_library()
+    if library is None:
+        _NATIVE_PRICING_REWARD_HELPER = False
+        return None
+    try:
+        function = library.pricing_optimistic_reward
+        function.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_size_t,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_int32,
+            ctypes.c_double,
+            ctypes.c_double,
+        ]
+        function.restype = ctypes.c_double
+    except Exception:
+        _NATIVE_PRICING_REWARD_HELPER = False
+        return None
+    _NATIVE_PRICING_REWARD_HELPER = function
     return function
 
 # ============================================================================
@@ -5006,6 +5065,9 @@ def solve_pricing_subproblem(
         )
         for stop_id in positive_dual_stops
     ]
+    positive_dual_index_by_stop_id = {
+        stop_id: idx for idx, stop_id in enumerate(positive_dual_stops)
+    }
     positive_dual_density_order = sorted(
         positive_dual_stop_items,
         key=lambda item: (
@@ -5095,7 +5157,11 @@ def solve_pricing_subproblem(
     ] = {}
     numpy_acceleration_enabled = np is not None
     native_dominance_helper = native_pricing_helper() if numpy_acceleration_enabled else None
+    native_reward_helper = (
+        native_pricing_reward_helper() if numpy_acceleration_enabled else None
+    )
     native_acceleration_enabled = native_dominance_helper is not None
+    native_reward_enabled = native_reward_helper is not None and bool(positive_dual_stop_items)
     if numpy_acceleration_enabled:
         label_capacity = 1024
         label_time_array = np.empty(label_capacity, dtype=np.float64)
@@ -5112,6 +5178,80 @@ def solve_pricing_subproblem(
         survivor_index_buffer_ptr = survivor_index_buffer.ctypes.data_as(
             ctypes.POINTER(ctypes.c_int32)
         )
+        native_survivor_count = ctypes.c_size_t(0)
+        native_label_mask = ctypes.c_uint64(0)
+        positive_dual_stop_bits_array = np.asarray(
+            [item[1] for item in positive_dual_stop_items],
+            dtype=np.uint64,
+        )
+        positive_dual_rewards_array = np.asarray(
+            [item[2] for item in positive_dual_stop_items],
+            dtype=np.float64,
+        )
+        positive_dual_demands_array = np.asarray(
+            [item[3] for item in positive_dual_stop_items],
+            dtype=np.float64,
+        )
+        positive_dual_services_array = np.asarray(
+            [item[4] for item in positive_dual_stop_items],
+            dtype=np.float64,
+        )
+        positive_dual_separated_masks_array = np.asarray(
+            [separated_mask_by_stop[item[0]] for item in positive_dual_stop_items],
+            dtype=np.uint64,
+        )
+        positive_dual_forced_pred_nodes_array = np.asarray(
+            [
+                -1
+                if branch_ctx.forced_predecessor.get(item[0]) is None
+                else int(branch_ctx.forced_predecessor[item[0]])
+                for item in positive_dual_stop_items
+            ],
+            dtype=np.int32,
+        )
+        positive_dual_forced_pred_bits_array = np.asarray(
+            [
+                0
+                if (
+                    branch_ctx.forced_predecessor.get(item[0]) is None
+                    or branch_ctx.forced_predecessor[item[0]] not in stop_mask
+                )
+                else stop_mask[branch_ctx.forced_predecessor[item[0]]]
+                for item in positive_dual_stop_items
+            ],
+            dtype=np.uint64,
+        )
+        density_order_array = np.asarray(
+            [positive_dual_index_by_stop_id[item[0]] for item in positive_dual_density_order],
+            dtype=np.int32,
+        )
+        service_order_array = np.asarray(
+            [positive_dual_index_by_stop_id[item[0]] for item in positive_dual_service_order],
+            dtype=np.int32,
+        )
+        positive_dual_stop_bits_ptr = positive_dual_stop_bits_array.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_uint64)
+        )
+        positive_dual_rewards_ptr = positive_dual_rewards_array.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_double)
+        )
+        positive_dual_demands_ptr = positive_dual_demands_array.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_double)
+        )
+        positive_dual_services_ptr = positive_dual_services_array.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_double)
+        )
+        positive_dual_separated_masks_ptr = positive_dual_separated_masks_array.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_uint64)
+        )
+        positive_dual_forced_pred_nodes_ptr = (
+            positive_dual_forced_pred_nodes_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        )
+        positive_dual_forced_pred_bits_ptr = positive_dual_forced_pred_bits_array.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_uint64)
+        )
+        density_order_ptr = density_order_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        service_order_ptr = service_order_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
 
         def ensure_label_capacity(required_size: int) -> None:
             nonlocal label_capacity, label_time_array, label_load_array
@@ -5311,6 +5451,29 @@ def solve_pricing_subproblem(
             0.0,
         )
 
+        if native_reward_enabled:
+            reward = native_reward_helper(
+                positive_dual_stop_bits_ptr,
+                positive_dual_rewards_ptr,
+                positive_dual_demands_ptr,
+                positive_dual_services_ptr,
+                positive_dual_separated_masks_ptr,
+                positive_dual_forced_pred_nodes_ptr,
+                positive_dual_forced_pred_bits_ptr,
+                len(positive_dual_stop_items),
+                density_order_ptr,
+                len(positive_dual_density_order),
+                service_order_ptr,
+                len(positive_dual_service_order),
+                ctypes.c_uint64(label.visited_mask),
+                ctypes.c_uint64(requirement_mask),
+                ctypes.c_int32(label.node),
+                optional_capacity,
+                optional_service_time,
+            )
+            optimistic_reward_cache[cache_key] = reward
+            return reward
+
         optional_mask = 0
         for stop_id, stop_bit, dual_reward, _, _ in positive_dual_stop_items:
             if label.visited_mask & stop_bit:
@@ -5497,6 +5660,8 @@ def solve_pricing_subproblem(
                     continue
 
                 survivor_count = ctypes.c_size_t(0)
+                native_survivor_count.value = 0
+                native_label_mask.value = label_mask
                 incumbent_dominates = native_dominance_helper(
                     idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
                     idx_array.size,
@@ -5508,16 +5673,16 @@ def solve_pricing_subproblem(
                     label_time,
                     label_load,
                     label_nonlabor,
-                    ctypes.c_uint64(label_mask),
+                    native_label_mask,
                     int(incumbent_can_dominate),
                     int(label_can_dominate),
                     survivor_index_buffer_ptr,
-                    ctypes.byref(survivor_count),
+                    ctypes.byref(native_survivor_count),
                 )
                 if incumbent_dominates:
                     return None
 
-                survivor_total = survivor_count.value
+                survivor_total = native_survivor_count.value
                 if survivor_total != idx_array.size:
                     removed_indices = idx_array[label_alive_array[idx_array] == 0]
                     for removed_idx in removed_indices.tolist():
