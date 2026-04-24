@@ -2538,7 +2538,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     vehicle_ids = sorted(instance.vehicles)
     node_ids = [DEPOT_NODE] + stop_ids
     node_pairs = [(i, j) for i in node_ids for j in node_ids if i != j]
-    arc_keys = [(v, i, j) for v in vehicle_ids for i, j in node_pairs]
+    total_arc_count = len(vehicle_ids) * len(node_pairs)
     identical_vehicle_groups: dict[tuple[Any, ...], list[int]] = {}
     for vehicle_id in vehicle_ids:
         vehicle = instance.vehicles[vehicle_id]
@@ -2673,7 +2673,36 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                     0.0,
                 )
 
-    x = model.addVars(arc_keys, vtype=GRB.BINARY, name="x")
+    feasible_arc_keys = [
+        (vehicle_id, i, j)
+        for vehicle_id in vehicle_ids
+        for i, j in node_pairs
+        if feasible_arc.get((vehicle_id, i, j), False)
+    ]
+    feasible_arc_keys_by_vehicle: dict[int, list[tuple[int, int]]] = {
+        vehicle_id: [] for vehicle_id in vehicle_ids
+    }
+    incoming_arc_keys_by_stop: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    outgoing_arc_keys_by_stop: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    start_arc_keys_by_vehicle: dict[int, list[tuple[int, int, int]]] = {
+        vehicle_id: [] for vehicle_id in vehicle_ids
+    }
+    return_arc_keys_by_vehicle: dict[int, list[tuple[int, int, int]]] = {
+        vehicle_id: [] for vehicle_id in vehicle_ids
+    }
+    for arc_key in feasible_arc_keys:
+        vehicle_id, i, j = arc_key
+        feasible_arc_keys_by_vehicle[vehicle_id].append((i, j))
+        if i == DEPOT_NODE:
+            start_arc_keys_by_vehicle[vehicle_id].append(arc_key)
+        else:
+            outgoing_arc_keys_by_stop.setdefault((vehicle_id, i), []).append(arc_key)
+        if j == DEPOT_NODE:
+            return_arc_keys_by_vehicle[vehicle_id].append(arc_key)
+        else:
+            incoming_arc_keys_by_stop.setdefault((vehicle_id, j), []).append(arc_key)
+
+    x = model.addVars(feasible_arc_keys, vtype=GRB.BINARY, name="x")
     visit = model.addVars(vehicle_ids, stop_ids, vtype=GRB.BINARY, name="visit")
     use_vehicle = model.addVars(vehicle_ids, vtype=GRB.BINARY, name="use_vehicle")
     depart_min = model.addVars(vehicle_ids, lb=0.0, ub=max_time_bound, name="depart_min")
@@ -2729,11 +2758,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         MIDDAY_LUNCH_BREAK_RULE.duration_min if MIDDAY_LUNCH_BREAK_RULE is not None else 0.0
     )
 
-    fixed_arc_count = 0
-    for vehicle_id, i, j in arc_keys:
-        if not feasible_arc.get((vehicle_id, i, j), False):
-            x[vehicle_id, i, j].ub = 0.0
-            fixed_arc_count += 1
+    fixed_arc_count = total_arc_count - len(feasible_arc_keys)
     for vehicle_id in vehicle_ids:
         for stop_id in stop_ids:
             if not feasible_vehicle_stop[vehicle_id, stop_id]:
@@ -2741,36 +2766,37 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
 
     incoming = {
         (vehicle_id, stop_id): gp.quicksum(
-            x[vehicle_id, i, stop_id] for i in node_ids if i != stop_id
+            x[arc_key] for arc_key in incoming_arc_keys_by_stop.get((vehicle_id, stop_id), [])
         )
         for vehicle_id in vehicle_ids
         for stop_id in stop_ids
     }
     outgoing = {
         (vehicle_id, stop_id): gp.quicksum(
-            x[vehicle_id, stop_id, j] for j in node_ids if j != stop_id
+            x[arc_key] for arc_key in outgoing_arc_keys_by_stop.get((vehicle_id, stop_id), [])
         )
         for vehicle_id in vehicle_ids
         for stop_id in stop_ids
     }
     starts = {
-        vehicle_id: gp.quicksum(x[vehicle_id, DEPOT_NODE, stop_id] for stop_id in stop_ids)
+        vehicle_id: gp.quicksum(x[arc_key] for arc_key in start_arc_keys_by_vehicle[vehicle_id])
         for vehicle_id in vehicle_ids
     }
     returns = {
-        vehicle_id: gp.quicksum(x[vehicle_id, stop_id, DEPOT_NODE] for stop_id in stop_ids)
+        vehicle_id: gp.quicksum(x[arc_key] for arc_key in return_arc_keys_by_vehicle[vehicle_id])
         for vehicle_id in vehicle_ids
     }
     first_customer_index_expr = {
         vehicle_id: gp.quicksum(
-            stop_id * x[vehicle_id, DEPOT_NODE, stop_id] for stop_id in stop_ids
+            stop_id * x[vehicle_id, DEPOT_NODE, stop_id]
+            for _, _, stop_id in start_arc_keys_by_vehicle[vehicle_id]
         )
         for vehicle_id in vehicle_ids
     }
     drive_min_expr = {
         vehicle_id: gp.quicksum(
             instance.travel_minutes[i, j] * x[vehicle_id, i, j]
-            for i, j in node_pairs
+            for i, j in feasible_arc_keys_by_vehicle[vehicle_id]
         )
         for vehicle_id in vehicle_ids
     }
@@ -2800,7 +2826,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 * instance.cost_params["Avg_Fuel_Consumption_L_per_mile"]
             )
             * x[vehicle_id, i, j]
-            for i, j in node_pairs
+            for i, j in feasible_arc_keys_by_vehicle[vehicle_id]
         )
         for vehicle_id in vehicle_ids
     }
@@ -2828,8 +2854,8 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 name=f"paired_stop_same_vehicle[{vehicle_id},{rule.stop_a},{rule.stop_b}]",
             )
             model.addConstr(
-                x[vehicle_id, rule.stop_a, rule.stop_b]
-                + x[vehicle_id, rule.stop_b, rule.stop_a]
+                x.get((vehicle_id, rule.stop_a, rule.stop_b), 0.0)
+                + x.get((vehicle_id, rule.stop_b, rule.stop_a), 0.0)
                 == visit[vehicle_id, rule.stop_a],
                 name=f"paired_stop_adjacent[{vehicle_id},{rule.stop_a},{rule.stop_b}]",
             )
@@ -2871,7 +2897,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             name=f"drive_service_duration_lb[{vehicle_id}]",
         )
 
-        for i, j in node_pairs:
+        for i, j in feasible_arc_keys_by_vehicle[vehicle_id]:
             model.addConstr(
                 x[vehicle_id, i, j] <= use_vehicle[vehicle_id],
                 name=f"arc_use_link[{vehicle_id},{i},{j}]",
