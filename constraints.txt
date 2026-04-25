@@ -1,17 +1,12 @@
-Fundamental constraints
+Final routing constraints
 
-1. Stop 3 (Redstone Medical Center) must be scheduled in the late afternoon. The contractual delivery commitment is 4:00 PM, so a morning delivery is not acceptable. Assume anything after 12:00 PM is fine for now.
-2. Stop 14 (Sunrise Senior Living) cannot be served before 10:00 AM.
-3. Any driver whose route overlaps midday must take one 30-minute lunch break between 11:30 AM and 1:30 PM.
-4. Stop 5 (Construction Supply, 8617 Fourth St) must be served by a Small Van only. The Hillcrest Road area has a five-ton county road restriction, so Large Truck assignments are not allowed for this stop. It is likely that medium trucks are also not allowed but should be verified before being ruled out.
-5. Under the current Hillcrest-road planning assumption, Stops 18, 19, 20, 21, and 22 must also be served by a Small Van only. Treat them as Hillcrest-access stops until a more precise road-access check is available.
-6. Stop 27 (Redstone Elementary School, 2005 Walnut St) should be treated as an afternoon after-school-program delivery. For now, enforce it as not before 12:00 PM.
-7. Main Street construction assumption: treat every solve as a Monday-through-Thursday construction day rather than a Friday. Add 20 minutes to any travel leg that goes to or from Stops 1, 2, 3, 4, 5, or 6.
-8. Oakwood noise-ordinance assumption: treat Stop 10 (Furniture Warehouse, 1751 Valley Rd) as subject to the residential delivery window and only allow service between 8:00 AM and 7:00 PM.
-
-Open verification item
-
-1. Stop 7 and Stop 8 should only be treated as one shared Redstone Plaza mall-dock delivery if they are confirmed to be the same plaza account. The review notes suggest their addresses may not match that assumption.
-2. Stop 19 is technically on Main Street as well, but the code intentionally ignores that stop for the Main Street construction rule for now.
-3. The Main Street construction rule is currently enforced as always active. If the actual operating day can vary, the model should eventually make Friday or day-of-week behavior explicit instead of relying on this standing assumption.
-4. The Oakwood delivery-window rule is currently enforced by assumption for Stop 10. If Stop 10 is later confirmed to be outside the Oakwood residential zone, this extra time window should be removed.
+1. Stop 3 (Redstone Medical Center) must be served between 12:45 PM and 5:15 PM.
+2. Stops 18, 19, 20, 21, and 22 are subject to the Hillcrest Road five-ton weight limit and may only be served by Small Vans.
+3. Stops 7 and 8 (Redstone Plaza Mall) must be served by the same vehicle on consecutive stops, in either order, with one combined 45-minute service block.
+4. Stop 14 (Sunrise Senior Living) cannot be served before 10:00 AM.
+5. Main Street construction is treated as active for every solve. Add 20 minutes to any travel leg that goes to or from Stops 1, 2, 3, 4, 5, or 6.
+6. Every used driver route must include one 30-minute lunch break scheduled between 11:30 AM and 1:30 PM.
+7. Vehicle 5 / Driver 5 may not service northern district Stops 23, 24, 25, 26, 27, or 28.
+8. Medium Truck 3 has a faulty liftgate. If Vehicle 3 serves a stop with demand over 50 kg, add 15 minutes of service time for the two-person crew workaround.
+9. Stops 10, 11, 12, and 13 are subject to the Oakwood noise ordinance and may only be served between 8:00 AM and 7:00 PM.
+10. Stop 27 (Redstone Elementary School Cafeteria) must be served before 4:00 PM.
