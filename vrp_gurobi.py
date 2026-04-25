@@ -56,7 +56,7 @@ EXACT_PRICING_NATIVE_MIN_BUCKET_SIZE = 2
 EXACT_PRICING_NUMPY_MIN_BUCKET_SIZE = 16
 # Bump whenever the default arc-flow MIP variable set or feasibility logic changes
 # in a way that can invalidate persisted .mst/.sol starts.
-DEFAULT_MIP_FORMULATION_VERSION = 12
+DEFAULT_MIP_FORMULATION_VERSION = 13
 DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
 DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT = 1.0
 _NATIVE_PRICING_LIBRARY: Any | None | bool = None
@@ -4218,7 +4218,9 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 model.addConstr(
                     time_from_depot_expr
                     >= time_from_depot_lb
-                    * (1 - x[vehicle_id, DEPOT_NODE, stop_id]),
+                    * (1 - x[vehicle_id, DEPOT_NODE, stop_id])
+                    + (vehicle_stop_lb[vehicle_id, stop_id] - service_start_lb[stop_id])
+                    * (visit[vehicle_id, stop_id] - x[vehicle_id, DEPOT_NODE, stop_id]),
                     name=f"time_from_depot[{vehicle_id},{stop_id}]",
                 )
                 load_from_depot_expr = load_after_kg[vehicle_id, stop_id] - stop.demand_kg
@@ -4301,20 +4303,19 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                             - served_after_lunch[vehicle_id, stop_id]
                         )
                     )
-                time_to_depot_lb = min(
+                time_to_depot_lb = (
                     -service_start_ub[stop_id]
                     - service_to_depot_min
-                    - instance.travel_minutes[stop_id, DEPOT_NODE],
-                    start_limit[vehicle_id]
-                    - vehicle_stop_ub[vehicle_id, stop_id]
-                    - service_to_depot_min
                     - instance.travel_minutes[stop_id, DEPOT_NODE]
-                    - lunch_duration_min,
                 )
                 model.addConstr(
                     time_to_depot_expr
                     >= time_to_depot_lb
-                    * (1 - x[vehicle_id, stop_id, DEPOT_NODE]),
+                    * (1 - x[vehicle_id, stop_id, DEPOT_NODE])
+                    + (start_limit[vehicle_id] - lunch_duration_min)
+                    * (use_vehicle[vehicle_id] - x[vehicle_id, stop_id, DEPOT_NODE])
+                    + (service_start_ub[stop_id] - vehicle_stop_ub[vehicle_id, stop_id])
+                    * (visit[vehicle_id, stop_id] - x[vehicle_id, stop_id, DEPOT_NODE]),
                     name=f"time_to_depot[{vehicle_id},{stop_id}]",
                 )
 
@@ -4358,7 +4359,17 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 model.addConstr(
                     time_between_stops_expr
                     >= time_between_stops_lb
-                    * (1 - x[vehicle_id, stop_id, next_stop]),
+                    * (1 - x[vehicle_id, stop_id, next_stop])
+                    + (
+                        vehicle_stop_lb[vehicle_id, next_stop]
+                        - service_start_lb[next_stop]
+                    )
+                    * (visit[vehicle_id, next_stop] - x[vehicle_id, stop_id, next_stop])
+                    + (
+                        service_start_ub[stop_id]
+                        - vehicle_stop_ub[vehicle_id, stop_id]
+                    )
+                    * (visit[vehicle_id, stop_id] - x[vehicle_id, stop_id, next_stop]),
                     name=f"time_between_stops[{vehicle_id},{stop_id},{next_stop}]",
                 )
                 if MIDDAY_LUNCH_BREAK_RULE is not None:
