@@ -56,7 +56,7 @@ EXACT_PRICING_NATIVE_MIN_BUCKET_SIZE = 2
 EXACT_PRICING_NUMPY_MIN_BUCKET_SIZE = 16
 # Bump whenever the default arc-flow MIP variable set or feasibility logic changes
 # in a way that can invalidate persisted .mst/.sol starts.
-DEFAULT_MIP_FORMULATION_VERSION = 10
+DEFAULT_MIP_FORMULATION_VERSION = 12
 DEFAULT_MIP_PROFILE_PATH = Path(__file__).with_name("gurobi_mip_profiles.json")
 DEFAULT_INCUMBENT_REPORT_MIN_IMPROVEMENT = 1.0
 _NATIVE_PRICING_LIBRARY: Any | None | bool = None
@@ -3797,6 +3797,8 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         for stop_id in stop_ids:
             if not feasible_vehicle_stop[vehicle_id, stop_id]:
                 visit[vehicle_id, stop_id].ub = 0.0
+                served_before_lunch[vehicle_id, stop_id].ub = 0.0
+                served_after_lunch[vehicle_id, stop_id].ub = 0.0
 
     incoming = {
         (vehicle_id, stop_id): gp.quicksum(
@@ -3845,6 +3847,17 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
     }
     service_after_stop_ub = {
         (vehicle_id, stop_id): max(
+            (
+                service_min_before_arc_for_vehicle_id(instance, vehicle_id, stop_id, j)
+                for _, _, j in outgoing_arc_keys_by_stop.get((vehicle_id, stop_id), [])
+            ),
+            default=0.0,
+        )
+        for vehicle_id in vehicle_ids
+        for stop_id in stop_ids
+    }
+    service_after_stop_lb = {
+        (vehicle_id, stop_id): min(
             (
                 service_min_before_arc_for_vehicle_id(instance, vehicle_id, stop_id, j)
                 for _, _, j in outgoing_arc_keys_by_stop.get((vehicle_id, stop_id), [])
@@ -3936,11 +3949,9 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 name=f"symmetry_use_order[{prev_vehicle_id},{next_vehicle_id}]",
             )
             model.addConstr(
-                (use_vehicle[next_vehicle_id] == 1)
-                >> (
-                    first_customer_index_expr[prev_vehicle_id]
-                    <= first_customer_index_expr[next_vehicle_id]
-                ),
+                first_customer_index_expr[prev_vehicle_id]
+                - first_customer_index_expr[next_vehicle_id]
+                <= max(stop_ids) * (1 - use_vehicle[next_vehicle_id]),
                 name=f"symmetry_first_customer[{prev_vehicle_id},{next_vehicle_id}]",
             )
             model.addConstr(
@@ -3969,6 +3980,16 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             )
 
         for stop_id in stop_ids:
+            model.addConstr(
+                service_after_stop_expr[vehicle_id, stop_id]
+                >= service_after_stop_lb[vehicle_id, stop_id] * visit[vehicle_id, stop_id],
+                name=f"service_after_stop_lb[{vehicle_id},{stop_id}]",
+            )
+            model.addConstr(
+                service_after_stop_expr[vehicle_id, stop_id]
+                <= service_after_stop_ub[vehicle_id, stop_id] * visit[vehicle_id, stop_id],
+                name=f"service_after_stop_ub[{vehicle_id},{stop_id}]",
+            )
             model.addConstr(
                 incoming[vehicle_id, stop_id] == visit[vehicle_id, stop_id],
                 name=f"incoming_visit[{vehicle_id},{stop_id}]",
@@ -4060,35 +4081,123 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 served_after_lunch[vehicle_id, stop_id] <= lunch_required[vehicle_id],
                 name=f"lunch_state_required_link[{vehicle_id},{stop_id}]",
             )
+            if MIDDAY_LUNCH_BREAK_RULE is not None and feasible_vehicle_stop[vehicle_id, stop_id]:
+                before_lunch_service_start_ub = (
+                    MIDDAY_LUNCH_BREAK_RULE.latest_start_min
+                    - service_after_stop_lb[vehicle_id, stop_id]
+                )
+                after_lunch_service_start_lb = (
+                    MIDDAY_LUNCH_BREAK_RULE.window_start_min
+                    + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                )
+                if vehicle_stop_lb[vehicle_id, stop_id] > before_lunch_service_start_ub + 1e-9:
+                    served_before_lunch[vehicle_id, stop_id].ub = 0.0
+                else:
+                    before_lunch_visit_tightening = (
+                        service_start_ub[stop_id] - vehicle_stop_ub[vehicle_id, stop_id]
+                    )
+                    before_lunch_state_tightening = max(
+                        vehicle_stop_ub[vehicle_id, stop_id]
+                        - before_lunch_service_start_ub,
+                        0.0,
+                    )
+                    if (
+                        before_lunch_visit_tightening > 1e-9
+                        or before_lunch_state_tightening > 1e-9
+                    ):
+                        model.addConstr(
+                            service_start_min[stop_id]
+                            <= service_start_ub[stop_id]
+                            - before_lunch_visit_tightening * visit[vehicle_id, stop_id]
+                            - before_lunch_state_tightening
+                            * served_before_lunch[vehicle_id, stop_id],
+                            name=f"before_lunch_service_start_ub[{vehicle_id},{stop_id}]",
+                        )
+                if vehicle_stop_ub[vehicle_id, stop_id] < after_lunch_service_start_lb - 1e-9:
+                    served_after_lunch[vehicle_id, stop_id].ub = 0.0
+                else:
+                    after_lunch_visit_tightening = (
+                        vehicle_stop_lb[vehicle_id, stop_id] - service_start_lb[stop_id]
+                    )
+                    after_lunch_state_tightening = max(
+                        after_lunch_service_start_lb
+                        - vehicle_stop_lb[vehicle_id, stop_id],
+                        0.0,
+                    )
+                    if (
+                        after_lunch_visit_tightening > 1e-9
+                        or after_lunch_state_tightening > 1e-9
+                    ):
+                        model.addConstr(
+                            service_start_min[stop_id]
+                            >= service_start_lb[stop_id]
+                            + after_lunch_visit_tightening * visit[vehicle_id, stop_id]
+                            + after_lunch_state_tightening
+                            * served_after_lunch[vehicle_id, stop_id],
+                            name=f"after_lunch_service_start_lb[{vehicle_id},{stop_id}]",
+                        )
             if MIDDAY_LUNCH_BREAK_RULE is not None:
+                before_lunch_expr = (
+                    service_start_min[stop_id]
+                    + service_after_stop_expr[vehicle_id, stop_id]
+                    - lunch_start_min[vehicle_id]
+                )
+                before_lunch_no_visit_ub = service_start_ub[stop_id]
+                before_lunch_after_visit_ub = (
+                    vehicle_stop_ub[vehicle_id, stop_id]
+                    + service_after_stop_ub[vehicle_id, stop_id]
+                    - MIDDAY_LUNCH_BREAK_RULE.window_start_min
+                )
                 model.addConstr(
-                    (served_before_lunch[vehicle_id, stop_id] == 1)
-                    >> (
-                        service_start_min[stop_id]
-                        + service_after_stop_expr[vehicle_id, stop_id]
-                        <= lunch_start_min[vehicle_id]
-                    ),
+                    before_lunch_expr
+                    <= before_lunch_no_visit_ub * (1 - visit[vehicle_id, stop_id])
+                    + before_lunch_after_visit_ub
+                    * served_after_lunch[vehicle_id, stop_id],
                     name=f"served_before_lunch[{vehicle_id},{stop_id}]",
                 )
+                after_lunch_expr = (
+                    service_start_min[stop_id]
+                    - lunch_start_min[vehicle_id]
+                    - MIDDAY_LUNCH_BREAK_RULE.duration_min
+                )
+                after_lunch_no_visit_lb = (
+                    service_start_lb[stop_id]
+                    - lunch_start_ub_by_vehicle[vehicle_id]
+                    - MIDDAY_LUNCH_BREAK_RULE.duration_min
+                )
+                after_lunch_before_visit_lb = (
+                    vehicle_stop_lb[vehicle_id, stop_id]
+                    - lunch_start_ub_by_vehicle[vehicle_id]
+                    - MIDDAY_LUNCH_BREAK_RULE.duration_min
+                )
                 model.addConstr(
-                    (served_after_lunch[vehicle_id, stop_id] == 1)
-                    >> (
-                        service_start_min[stop_id]
-                        >= lunch_start_min[vehicle_id]
-                        + MIDDAY_LUNCH_BREAK_RULE.duration_min
-                    ),
+                    after_lunch_expr
+                    >= after_lunch_no_visit_lb * (1 - visit[vehicle_id, stop_id])
+                    + after_lunch_before_visit_lb
+                    * served_before_lunch[vehicle_id, stop_id],
                     name=f"served_after_lunch[{vehicle_id},{stop_id}]",
                 )
-            model.addConstr(
-                (visit[vehicle_id, stop_id] == 1)
-                >> (service_start_min[stop_id] >= vehicle_stop_lb[vehicle_id, stop_id]),
-                name=f"visit_time_lb[{vehicle_id},{stop_id}]",
-            )
-            model.addConstr(
-                (visit[vehicle_id, stop_id] == 1)
-                >> (service_start_min[stop_id] <= vehicle_stop_ub[vehicle_id, stop_id]),
-                name=f"visit_time_ub[{vehicle_id},{stop_id}]",
-            )
+            if feasible_vehicle_stop[vehicle_id, stop_id]:
+                visit_lb_tightening = (
+                    vehicle_stop_lb[vehicle_id, stop_id] - service_start_lb[stop_id]
+                )
+                if visit_lb_tightening > 1e-9:
+                    model.addConstr(
+                        service_start_min[stop_id]
+                        >= service_start_lb[stop_id]
+                        + visit_lb_tightening * visit[vehicle_id, stop_id],
+                        name=f"visit_time_lb[{vehicle_id},{stop_id}]",
+                    )
+                visit_ub_tightening = (
+                    service_start_ub[stop_id] - vehicle_stop_ub[vehicle_id, stop_id]
+                )
+                if visit_ub_tightening > 1e-9:
+                    model.addConstr(
+                        service_start_min[stop_id]
+                        <= service_start_ub[stop_id]
+                        - visit_ub_tightening * visit[vehicle_id, stop_id],
+                        name=f"visit_time_ub[{vehicle_id},{stop_id}]",
+                    )
             if feasible_arc[vehicle_id, DEPOT_NODE, stop_id]:
                 time_from_depot_expr = (
                     service_start_min[stop_id]
@@ -4100,14 +4209,24 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                         MIDDAY_LUNCH_BREAK_RULE.duration_min
                         * served_after_lunch[vehicle_id, stop_id]
                     )
-                model.addConstr(
-                    (x[vehicle_id, DEPOT_NODE, stop_id] == 1)
-                    >> (time_from_depot_expr >= 0.0),
-                    name=f"time_from_depot[{vehicle_id},{stop_id}]",
+                time_from_depot_lb = (
+                    service_start_lb[stop_id]
+                    - start_limit[vehicle_id]
+                    - instance.travel_minutes[DEPOT_NODE, stop_id]
+                    - lunch_duration_min
                 )
                 model.addConstr(
-                    (x[vehicle_id, DEPOT_NODE, stop_id] == 1)
-                    >> (load_after_kg[vehicle_id, stop_id] - stop.demand_kg == 0.0),
+                    time_from_depot_expr
+                    >= time_from_depot_lb
+                    * (1 - x[vehicle_id, DEPOT_NODE, stop_id]),
+                    name=f"time_from_depot[{vehicle_id},{stop_id}]",
+                )
+                load_from_depot_expr = load_after_kg[vehicle_id, stop_id] - stop.demand_kg
+                model.addConstr(
+                    load_from_depot_expr
+                    <= (vehicle.capacity_kg - stop.demand_kg)
+                    * (visit[vehicle_id, stop_id] - x[vehicle_id, DEPOT_NODE, stop_id])
+                    - stop.demand_kg * (1 - visit[vehicle_id, stop_id]),
                     name=f"load_from_depot[{vehicle_id},{stop_id}]",
                 )
                 if MIDDAY_LUNCH_BREAK_RULE is not None:
@@ -4128,23 +4247,50 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                         - 1,
                         name=f"lunch_before_start_arc_lb[{vehicle_id},{stop_id}]",
                     )
+                    lunch_on_first_arc_expr = (
+                        lunch_start_min[vehicle_id]
+                        - service_start_min[stop_id]
+                        + instance.travel_minutes[DEPOT_NODE, stop_id]
+                        + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                    )
+                    lunch_on_first_arc_no_after_ub = (
+                        lunch_start_ub_by_vehicle[vehicle_id]
+                        - service_start_lb[stop_id]
+                        + instance.travel_minutes[DEPOT_NODE, stop_id]
+                        + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                    )
+                    lunch_on_first_arc_after_not_first_ub = (
+                        lunch_start_ub_by_vehicle[vehicle_id]
+                        - max(
+                            vehicle_stop_lb[vehicle_id, stop_id],
+                            MIDDAY_LUNCH_BREAK_RULE.window_start_min
+                            + MIDDAY_LUNCH_BREAK_RULE.duration_min,
+                        )
+                        + instance.travel_minutes[DEPOT_NODE, stop_id]
+                        + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                    )
                     model.addConstr(
-                        (lunch_before_start_arc[vehicle_id, stop_id] == 1)
-                        >> (
-                            lunch_start_min[vehicle_id]
-                            <= service_start_min[stop_id]
-                            - instance.travel_minutes[DEPOT_NODE, stop_id]
-                            - MIDDAY_LUNCH_BREAK_RULE.duration_min
+                        lunch_on_first_arc_expr
+                        <= lunch_on_first_arc_no_after_ub
+                        * (1 - served_after_lunch[vehicle_id, stop_id])
+                        + lunch_on_first_arc_after_not_first_ub
+                        * (
+                            served_after_lunch[vehicle_id, stop_id]
+                            - lunch_before_start_arc[vehicle_id, stop_id]
                         ),
                         name=f"lunch_on_first_arc_ub[{vehicle_id},{stop_id}]",
                     )
             if feasible_arc[vehicle_id, stop_id, DEPOT_NODE]:
+                service_to_depot_min = service_min_before_arc_for_vehicle_id(
+                    instance,
+                    vehicle_id,
+                    stop_id,
+                    DEPOT_NODE,
+                )
                 time_to_depot_expr = (
                     return_min[vehicle_id]
                     - service_start_min[stop_id]
-                    - service_min_before_arc_for_vehicle_id(
-                        instance, vehicle_id, stop_id, DEPOT_NODE
-                    )
+                    - service_to_depot_min
                     - instance.travel_minutes[stop_id, DEPOT_NODE]
                 )
                 if MIDDAY_LUNCH_BREAK_RULE is not None:
@@ -4155,9 +4301,20 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                             - served_after_lunch[vehicle_id, stop_id]
                         )
                     )
+                time_to_depot_lb = min(
+                    -service_start_ub[stop_id]
+                    - service_to_depot_min
+                    - instance.travel_minutes[stop_id, DEPOT_NODE],
+                    start_limit[vehicle_id]
+                    - vehicle_stop_ub[vehicle_id, stop_id]
+                    - service_to_depot_min
+                    - instance.travel_minutes[stop_id, DEPOT_NODE]
+                    - lunch_duration_min,
+                )
                 model.addConstr(
-                    (x[vehicle_id, stop_id, DEPOT_NODE] == 1)
-                    >> (time_to_depot_expr >= 0.0),
+                    time_to_depot_expr
+                    >= time_to_depot_lb
+                    * (1 - x[vehicle_id, stop_id, DEPOT_NODE]),
                     name=f"time_to_depot[{vehicle_id},{stop_id}]",
                 )
 
@@ -4166,19 +4323,21 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                 if stop_id == next_stop or not feasible_arc[vehicle_id, stop_id, next_stop]:
                     continue
                 model.addConstr(
-                    (x[vehicle_id, stop_id, next_stop] == 1)
-                    >> (
-                        served_after_lunch[vehicle_id, next_stop]
-                        >= served_after_lunch[vehicle_id, stop_id]
-                    ),
+                    served_after_lunch[vehicle_id, next_stop]
+                    - served_after_lunch[vehicle_id, stop_id]
+                    >= -(1 - x[vehicle_id, stop_id, next_stop]),
                     name=f"lunch_state_monotone[{vehicle_id},{stop_id},{next_stop}]",
+                )
+                stop_to_next_service_min = service_min_before_arc_for_vehicle_id(
+                    instance,
+                    vehicle_id,
+                    stop_id,
+                    next_stop,
                 )
                 time_between_stops_expr = (
                     service_start_min[next_stop]
                     - service_start_min[stop_id]
-                    - service_min_before_arc_for_vehicle_id(
-                        instance, vehicle_id, stop_id, next_stop
-                    )
+                    - stop_to_next_service_min
                     - instance.travel_minutes[stop_id, next_stop]
                 )
                 if MIDDAY_LUNCH_BREAK_RULE is not None:
@@ -4189,9 +4348,17 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                             - served_after_lunch[vehicle_id, stop_id]
                         )
                     )
+                time_between_stops_lb = (
+                    service_start_lb[next_stop]
+                    - service_start_ub[stop_id]
+                    - stop_to_next_service_min
+                    - instance.travel_minutes[stop_id, next_stop]
+                    - lunch_duration_min
+                )
                 model.addConstr(
-                    (x[vehicle_id, stop_id, next_stop] == 1)
-                    >> (time_between_stops_expr >= 0.0),
+                    time_between_stops_expr
+                    >= time_between_stops_lb
+                    * (1 - x[vehicle_id, stop_id, next_stop]),
                     name=f"time_between_stops[{vehicle_id},{stop_id},{next_stop}]",
                 )
                 if MIDDAY_LUNCH_BREAK_RULE is not None:
@@ -4212,25 +4379,59 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
                         - 1,
                         name=f"lunch_before_stop_arc_lb[{vehicle_id},{stop_id},{next_stop}]",
                     )
+                    lunch_between_stops_expr = (
+                        lunch_start_min[vehicle_id]
+                        - service_start_min[next_stop]
+                        + instance.travel_minutes[stop_id, next_stop]
+                        + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                    )
+                    lunch_between_stops_no_after_ub = (
+                        lunch_start_ub_by_vehicle[vehicle_id]
+                        - service_start_lb[next_stop]
+                        + instance.travel_minutes[stop_id, next_stop]
+                        + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                    )
+                    lunch_between_stops_after_not_arc_ub = (
+                        lunch_start_ub_by_vehicle[vehicle_id]
+                        - max(
+                            vehicle_stop_lb[vehicle_id, next_stop],
+                            MIDDAY_LUNCH_BREAK_RULE.window_start_min
+                            + MIDDAY_LUNCH_BREAK_RULE.duration_min,
+                        )
+                        + instance.travel_minutes[stop_id, next_stop]
+                        + MIDDAY_LUNCH_BREAK_RULE.duration_min
+                    )
                     model.addConstr(
-                        (lunch_before_stop_arc[vehicle_id, stop_id, next_stop] == 1)
-                        >> (
-                            lunch_start_min[vehicle_id]
-                            <= service_start_min[next_stop]
-                            - instance.travel_minutes[stop_id, next_stop]
-                            - MIDDAY_LUNCH_BREAK_RULE.duration_min
+                        lunch_between_stops_expr
+                        <= lunch_between_stops_no_after_ub
+                        * (1 - served_after_lunch[vehicle_id, next_stop])
+                        + lunch_between_stops_after_not_arc_ub
+                        * (
+                            served_after_lunch[vehicle_id, next_stop]
+                            - lunch_before_stop_arc[vehicle_id, stop_id, next_stop]
                         ),
                         name=f"lunch_between_stops_ub[{vehicle_id},{stop_id},{next_stop}]",
                     )
+                load_progress_expr = (
+                    load_after_kg[vehicle_id, next_stop]
+                    - load_after_kg[vehicle_id, stop_id]
+                    - instance.stops[next_stop].demand_kg
+                )
                 model.addConstr(
-                    (x[vehicle_id, stop_id, next_stop] == 1)
-                    >> (
-                        load_after_kg[vehicle_id, next_stop]
-                        - load_after_kg[vehicle_id, stop_id]
-                        - instance.stops[next_stop].demand_kg
-                        == 0.0
-                    ),
-                    name=f"load_progress[{vehicle_id},{stop_id},{next_stop}]",
+                    load_progress_expr
+                    >= -(vehicle.capacity_kg + instance.stops[next_stop].demand_kg)
+                    * (visit[vehicle_id, stop_id] - x[vehicle_id, stop_id, next_stop])
+                    - instance.stops[next_stop].demand_kg
+                    * (1 - visit[vehicle_id, stop_id]),
+                    name=f"load_progress_lb[{vehicle_id},{stop_id},{next_stop}]",
+                )
+                model.addConstr(
+                    load_progress_expr
+                    <= (vehicle.capacity_kg - instance.stops[next_stop].demand_kg)
+                    * (visit[vehicle_id, next_stop] - x[vehicle_id, stop_id, next_stop])
+                    - instance.stops[next_stop].demand_kg
+                    * (1 - visit[vehicle_id, next_stop]),
+                    name=f"load_progress_ub[{vehicle_id},{stop_id},{next_stop}]",
                 )
 
     objective = gp.quicksum(
