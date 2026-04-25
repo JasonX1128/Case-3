@@ -3588,6 +3588,7 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
         )
         for vehicle_id in vehicle_ids
     }
+    total_demand_kg = sum(instance.stops[stop_id].demand_kg for stop_id in stop_ids)
     active_min_expr = {
         vehicle_id: return_min[vehicle_id] - depart_min[vehicle_id] for vehicle_id in vehicle_ids
     }
@@ -3614,6 +3615,15 @@ def build_arc_flow_model(instance: Instance) -> tuple[gp.Model, dict[str, Any]]:
             late_min[stop_id] >= service_start_min[stop_id] - instance.stops[stop_id].latest_min,
             name=f"late_lb[{stop_id}]",
         )
+
+    model.addConstr(
+        gp.quicksum(
+            instance.vehicles[vehicle_id].capacity_kg * use_vehicle[vehicle_id]
+            for vehicle_id in vehicle_ids
+        )
+        >= total_demand_kg,
+        name="global_capacity_cover",
+    )
 
     # Hard operational rule: the Redstone Plaza deliveries must stay on the
     # same truck and be served consecutively, but the model may choose 7->8 or
