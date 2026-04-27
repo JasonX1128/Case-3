@@ -30,12 +30,12 @@
     "params": {
       "MIPFocus": 3,
       "Heuristics": 0.00,
-      "Cuts": 3,
+      "Cuts": 0,
       "Symmetry": 2,
       "Presolve": 2,
       "IntegralityFocus": 1,
-      "Threads": -1,
-      "NodefileStart": 0.5
+      "Threads": 11,
+      "NodefileStart": 2.0
     }
   },
   "find-incumbent": {

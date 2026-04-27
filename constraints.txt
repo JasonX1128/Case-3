@@ -5,7 +5,7 @@ Final routing constraints
 3. Stops 7 and 8 (Redstone Plaza Mall) must be served by the same vehicle on consecutive stops, in either order, with one combined 45-minute service block.
 4. Stop 14 (Sunrise Senior Living) cannot be served before 10:00 AM.
 5. Main Street construction is treated as active for every solve. Add 20 minutes to any travel leg that goes to or from Stops 1, 2, 3, 4, 5, or 6.
-6. Every used driver route must include one 30-minute lunch break scheduled between 11:30 AM and 1:30 PM.
+6. A driver may not make deliveries during the 11:30 AM-1:30 PM lunch window unless that route includes one 30-minute break scheduled within the window; routes with all delivery service outside the window do not require a break.
 7. Vehicle 5 / Driver 5 may not service northern district Stops 23, 24, 25, 26, 27, or 28.
 8. Medium Truck 3 has a faulty liftgate. If Vehicle 3 serves a stop with demand over 50 kg, add 15 minutes of service time for the two-person crew workaround.
 9. Stops 10, 11, 12, and 13 are subject to the Oakwood noise ordinance and may only be served between 8:00 AM and 7:00 PM.
